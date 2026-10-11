@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in the collector or the app doesn't work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please leave out prompts, code, file paths and session IDs, or replace them with placeholders.
+        If the collector records something it shouldn't, don't file it here: use "Report a vulnerability" on the Security tab instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and version
+      placeholder: Claude Code 2.1 (CLI), Codex desktop app …
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Pitwall and macOS versions
+      placeholder: Pitwall 0.1.0, macOS 15.5
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        In Pitwall, Settings → "Copy diagnostics" (it contains no conversations, prompts, session IDs or keys), and/or the output of `~/.pitwall/bin/pitwall-events doctor`.
+      render: text
+  - type: textarea
+    id: events
+    attributes:
+      label: Recorded events (optional)
+      description: Relevant lines from `~/.pitwall/bin/pitwall-events tail`, with personal details replaced by placeholders.
+      render: text

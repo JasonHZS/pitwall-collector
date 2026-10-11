@@ -1,0 +1,158 @@
+#!/bin/sh
+# pitwall-hook：把 coding agent 的 hook 事件脱敏后追加到本地 spool 文件。
+#
+#   pitwall-hook <agent> <event>    # payload 从 stdin 传入
+#
+# 只观察、不干预：永远不写 stdout、永远 exit 0，所以不会批准/拒绝审批、
+# 不会阻塞 prompt，也不会往 agent 上下文里注入内容。
+# 桌面 App 启动的 agent 的 PATH 很短，这里只用绝对路径的系统命令。
+
+agent=${1:-unknown}
+event=${2:-}
+dir="${PITWALL_HOME:-$HOME/.pitwall}/events"
+JQ=/usr/bin/jq
+
+if [ ! -x "$JQ" ] || ! /bin/mkdir -p "$dir" 2>/dev/null; then
+  /bin/cat >/dev/null 2>&1
+  exit 0
+fi
+
+# 会话开始 / 任务开始时额外记录进程与终端线索，供之后「返回原会话」使用。
+proc='' parent_proc='' ghostty_env=''
+case "$event" in
+  SessionStart | sessionStart | UserPromptSubmit | beforeSubmitPrompt)
+    proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$PPID" 2>/dev/null)
+    gp=$(printf '%s\n' "$proc" | /usr/bin/awk 'NR == 1 { print $2 }')
+    [ -n "$gp" ] && parent_proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$gp" 2>/dev/null)
+    ghostty_env=$(/usr/bin/env | /usr/bin/sed -n 's/^\(GHOSTTY_[A-Za-z0-9_]*\)=.*/\1/p' | /usr/bin/tr '\n' ' ')
+    ;;
+esac
+
+# 只保留状态相关字段：prompt 只留首行前 80 字（开头由客户端成对标签包住的注入块，如
+# <in-app-browser-context …>…</in-app-browser-context>，先跳过，只把标签名记进 prompt_wrappers）；tool_input、工具输出、回复正文、邮箱等一律丢弃，
+# 仅用 payload_keys 记录字段名，方便以后核对各 agent 的 payload 结构。
+# Claude Code 的 prompt_id（任务归属）、agent_id / agent_type（subagent 事件）与
+# is_interrupt（工具被用户中断）只是标识与布尔值，原样记录。
+# Claude Code 的 Stop 另派生 background_subagent_running 布尔值与 background_task_shapes
+# （type/status 去重、最多 8 个、非法取值记为 ?），不保存任务描述、命令等详情。
+# 例外（仅 Claude Code，用来告诉用户「在等什么」「结果如何」）：PermissionRequest 记 tool_summary
+# （命令 / 文件路径 / URL 的首个非空行，前 120 字），Stop 记 reply_head（最后一条回复压成一行的前 160 字）。
+FILTER='
+def cut($n): if type == "string" and length > $n then .[0:$n] + "…" else . end;
+def text: if type == "string" or type == "null" then . else tojson end;
+def shape_token: if type == "string" and test("^[A-Za-z0-9_.-]{1,40}$") then . else "?" end;
+def line_head($n): if type == "string" then ([splits("\r?\n")] | map(select(test("\\S"))) | (.[0] // "") | sub("^\\s+"; "") | sub("\\s+$"; "") | cut($n)) else null end;
+def first_line: line_head(80);
+# 开头的注入块（<tag …>…</tag> 或 <tag …/>）逐个剥掉，只留标签名（最多 8 个，非法名记为 ?）。
+def unwrap($tags):
+  (capture("\\A\\s*<(?<tag>[A-Za-z][A-Za-z0-9_.:-]*)(?:\\s[^<>]*)?(?:/>|>[\\s\\S]*?</\\k<tag>\\s*>)(?<rest>[\\s\\S]*)\\z") // null) as $m
+  | if $m == null then {text: ., tags: $tags}
+    else ($m.rest | unwrap(if ($tags | length) < 8 then $tags + [$m.tag | shape_token] else $tags end))
+  end;
+# 剥完只剩空白时退回原文首行，不丢掉摘要。
+def prompt_parts: if type == "string" then (unwrap([]) as $u | if ($u.text | test("\\S")) then $u else {text: ., tags: []} end) else {text: null, tags: []} end;
+# Chrome 插件把标签页上下文放在固定的 Markdown 区块中；只在父进程是 Chrome 插件宿主时识别
+# 开头的完整区块（标签页列表可以为空），不把其它形态或用户正文里同名的标题当作分隔符。
+# 空请求保持缺失，不退回标签页上下文。
+def chrome_request:
+  if $agent == "codex" and ($parent_proc | contains("ChatGPT for Chrome")) and type == "string" then
+    (capture("\\A\\s*# Chrome tabs:[ \\t]*\\r?\\n(?:[\\s\\S]*?\\r?\\n)?## My request:(?<request>(?:[ \\t\\r\\n][\\s\\S]*)?)\\z") // null) as $m
+    | if $m == null then . else ($m.request | if test("\\S") then . else null end) end
+  else . end;
+def squashed($n): if type == "string" then (gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "") | cut($n)) else null end;
+def blank: if . == "" then null else . end;
+def proc_row: if . == null then null else (capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<tty>\\S+)\\s+(?<comm>.*)$") // null) end;
+if type != "object" then error("payload is not an object") else . end
+# Cursor 会顺带执行 ~/.claude/settings.json 里的 Claude hook（payload 带 cursor_version）；
+# 同一事件已由 Cursor 自己的 hook 记录，这里跳过，避免把 Cursor 会话记成 Claude Code。
+| if $agent != "cursor" and has("cursor_version") then {_skip: true}
+# Devin CLI 兼容 Claude Code 的 hook 格式，可能顺带执行 ~/.claude/settings.json 里的 Claude hook。
+# Devin 的 payload 没有 transcript_path，且环境里有 DEVIN_PROJECT_DIR；这类事件跳过，只由 Devin 自己的 hook 记录。
+elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_path") | not) then {_skip: true} else
+. as $p
+| (($event | blank) // $p.hook_event_name) as $ev
+| ($p.background_tasks | if type == "array" then . else null end) as $bg
+| ($p.prompt | prompt_parts) as $prompt
+| {
+    v: 1,
+    ts: (now * 1000 | floor),
+    agent: $agent,
+    event: ($ev // "unknown"),
+    session_id: (($p.session_id | blank) // ($p.conversation_id | blank)),
+    turn_id: ($p.turn_id // $p.generation_id),
+    prompt_id: ($p.prompt_id | if type == "string" then cut(80) else null end),
+    agent_id: ($p.agent_id | if type == "string" then cut(80) else null end),
+    agent_type: ($p.agent_type | if type == "string" then cut(60) else null end),
+    is_interrupt: ($p.is_interrupt | if type == "boolean" then . else null end),
+    # Devin 的 payload 不带 cwd，用它设置的 DEVIN_PROJECT_DIR（项目目录）代替。
+    cwd: ($p.cwd // ($p.workspace_roots | if type == "array" then .[0] else null end)
+          // (if $agent == "devin" then ($devin_project_dir | blank) else null end)),
+    workspace_roots: $p.workspace_roots,
+    transcript_path: $p.transcript_path,
+    permission_mode: $p.permission_mode,
+    model: ($p.model | if type == "string" then . else null end),
+    source: $p.source,
+    tool_name: $p.tool_name,
+    notification_type: $p.notification_type,
+    title: ($p.title | text | cut(120)),
+    message: ($p.message | text | cut(160)),
+    reason: ($p.reason | text | cut(120)),
+    status: ($p.status | text | cut(40)),
+    error: ($p.error | text | cut(200)),
+    stop_hook_active: $p.stop_hook_active,
+    background_subagent_running:
+      (if $agent == "claude-code" and $ev == "Stop" and $bg != null
+       then any($bg[]?; type == "object" and .type == "subagent" and .status == "running")
+       else null
+       end),
+    background_task_shapes:
+      (if $agent == "claude-code" and $ev == "Stop" and $bg != null
+       then ([$bg[]?
+              | if type == "object" then ((.type | shape_token) + "/" + (.status | shape_token)) else "?" end]
+             | unique | .[0:8])
+       else null
+       end),
+    prompt_head: ($prompt.text | chrome_request | first_line),
+    prompt_wrappers: ($prompt.tags | if length > 0 then . else null end),
+    tool_summary:
+      (if $agent == "claude-code" and $ev == "PermissionRequest"
+       then ($p.tool_input
+             | if type == "object" then (.command // .file_path // .notebook_path // .url // .path // .pattern) else null end
+             | line_head(120) | blank)
+       else null
+       end),
+    reply_head:
+      (if $agent == "claude-code" and $ev == "Stop" then ($p.last_assistant_message | squashed(160) | blank) else null end),
+    payload_keys: ($p | keys),
+    ctx: ({
+      ppid: ($ppid | tonumber? // null),
+      proc: ($proc | blank | proc_row),
+      parent_proc: ($parent_proc | blank | proc_row),
+      term_program: ($term_program | blank),
+      term_session_id: ($term_session_id | blank),
+      iterm_session_id: ($iterm_session_id | blank),
+      tmux_pane: ($tmux_pane | blank),
+      bundle_id: ($bundle_id | blank),
+      ghostty_env: ($ghostty_env | blank)
+    } | with_entries(select(.value != null)))
+  }
+| with_entries(select(.value != null and .value != {}))
+end
+'
+
+line=$("$JQ" -c \
+  --arg agent "$agent" --arg event "$event" --arg ppid "$PPID" \
+  --arg proc "$proc" --arg parent_proc "$parent_proc" --arg ghostty_env "$ghostty_env" \
+  --arg term_program "${TERM_PROGRAM:-}" --arg term_session_id "${TERM_SESSION_ID:-}" \
+  --arg iterm_session_id "${ITERM_SESSION_ID:-}" --arg tmux_pane "${TMUX_PANE:-}" \
+  --arg bundle_id "${__CFBundleIdentifier:-}" --arg devin_project_dir "${DEVIN_PROJECT_DIR:-}" \
+  "$FILTER" 2>/dev/null)
+
+if [ -z "$line" ]; then
+  line=$("$JQ" -nc --arg agent "$agent" --arg event "$event" \
+    '{v: 1, ts: (now * 1000 | floor), agent: $agent, event: (if $event == "" then "unknown" else $event end), parse_error: true}')
+fi
+
+[ "$line" = '{"_skip":true}' ] && exit 0
+printf '%s\n' "$line" >> "$dir/$agent.jsonl" 2>/dev/null
+exit 0

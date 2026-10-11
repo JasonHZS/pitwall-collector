@@ -1,0 +1,335 @@
+#!/bin/sh
+# pitwall-events：查看 pitwall 采集到的 hook 事件。
+# 开发期观察工具——state 列只按事件顺序粗略推断，不是 MVP 规范里的正式状态机。
+#
+#   pitwall-events tail [-n 条数] [-f]   最近事件（-f 持续跟随）
+#   pitwall-events hooks                 列出已登记的 hook、调用的脚本以及记录范围
+#   pitwall-events status [--json]       每个会话按事件推断的当前状态
+#   pitwall-events summary               各 agent 收到过哪些事件、是否出现过等待/审批信号
+#   pitwall-events doctor                检查 hook 安装、Codex 信任状态和最近事件
+#   pitwall-events jump <session-id>  显示会话定位信息与保守降级路径
+set -eu
+
+JQ=/usr/bin/jq
+PW_HOME=${PITWALL_HOME:-$HOME/.pitwall}
+EVENTS_DIR="$PW_HOME/events"
+AGENTS="claude-code codex cursor pi devin"
+
+JQ_LIB='
+def ts_local: (.ts / 1000 | localtime | strftime("%m-%d %H:%M:%S"));
+def pad($n): tostring | if length >= $n then .[0:$n] else . + (" " * ($n - length)) end;
+def short_sid: (.session_id // "-" | tostring | .[0:8]);
+def base: (.cwd // "-" | tostring | split("/") | last);
+def detail:
+  [ .tool_name, .notification_type, .status, .stop_reason, .kind, .reason, .source,
+    (.prompt_head | if . then "「" + . + "」" else null end),
+    (if .parse_error then "parse_error" else null end) ]
+  | map(select(. != null and . != "") | tostring) | join(" ");
+def event_line: "\(ts_local)  \(.agent | pad(11)) \(.event | pad(20)) \(short_sid)  \(base | pad(20)) \(detail)";
+
+# 单个事件的含义：waiting / running / done / failed / cancelled / idle / closed，
+# keep = 不改变状态，settled = Pi 本轮结束（沿用之前的失败/取消）。
+def classify:
+  .event as $ev
+  | if ($ev | test("^(SessionEnd|sessionEnd|session_shutdown)$")) then "closed"
+    elif $ev == "PermissionRequest" or $ev == "Elicitation" or $ev == "ui_prompt_start"
+         or ($ev == "Notification" and (.notification_type == "permission_prompt" or .notification_type == "elicitation_dialog"))
+      then "waiting"
+    elif $ev == "StopFailure" or ($ev == "stop" and .status == "error") or ($ev == "message_end" and .stop_reason == "error")
+      then "failed"
+    elif ($ev == "stop" and .status == "aborted") or ($ev == "message_end" and .stop_reason == "aborted") then "cancelled"
+    elif .agent == "claude-code" and $ev == "Stop" and .background_subagent_running == true then "running"
+    elif $ev == "Stop" or $ev == "stop" then "done"
+    elif $ev == "agent_settled" then "settled"
+    elif ($ev | test("^(SessionStart|sessionStart|session_start)$")) then "idle"
+    elif $ev == "Notification" or $ev == "agent_end" or $ev == "message_end" or .parse_error then "keep"
+    else "running" end;
+def step($prev; $e):
+  ($e | classify) as $c
+  | if $c == "keep" then $prev
+    elif $c == "settled" then (if $prev == "failed" or $prev == "cancelled" then $prev else "done" end)
+    elif $c == "idle" then (if $prev == null or $prev == "closed" then "idle" else $prev end)
+    else $c end;
+def load: [inputs | fromjson? | select(type == "object")];
+'
+
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
+
+spools() {
+  found=''
+  for a in $AGENTS; do
+    [ -s "$EVENTS_DIR/$a.jsonl" ] && found="$found $EVENTS_DIR/$a.jsonl"
+  done
+  printf '%s' "$found"
+}
+
+cmd_tail() {
+  n=30 follow=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) n=$2; shift 2 ;;
+      -f) follow=1; shift ;;
+      *) usage; exit 2 ;;
+    esac
+  done
+  files=$(spools)
+  if [ -n "$files" ]; then
+    # shellcheck disable=SC2086
+    cat $files | "$JQ" -nrR --argjson n "$n" "$JQ_LIB"'
+      load | sort_by(.ts) | .[((length - $n) | if . < 0 then 0 else . end):][] | event_line'
+  else
+    echo "还没有事件（$EVENTS_DIR）"
+  fi
+  if [ "$follow" = 1 ]; then
+    mkdir -p "$EVENTS_DIR"
+    for a in $AGENTS; do touch "$EVENTS_DIR/$a.jsonl"; done
+    tail -q -n 0 -F "$EVENTS_DIR"/*.jsonl | "$JQ" -rR --unbuffered "$JQ_LIB"'fromjson? | select(type == "object") | event_line'
+  fi
+}
+
+cmd_status() {
+  as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
+  files=$(spools)
+  [ -n "$files" ] || { echo "还没有事件（$EVENTS_DIR）"; return 0; }
+  [ "$as_json" = 1 ] || printf '%-15s %-11s %-9s %-9s %-20s %-20s %s\n' "最后事件时间" agent "state*" session cwd "最后事件" "最近任务"
+  # shellcheck disable=SC2086
+  cat $files | "$JQ" -nrR --argjson as_json "$as_json" "$JQ_LIB"'
+    load
+    | map(select(.session_id != null))
+    | group_by([.agent, .session_id])
+    | map(sort_by(.ts) | {
+        agent: .[0].agent,
+        session_id: .[0].session_id,
+        cwd: (map(.cwd // empty) | last),
+        prompt_head: (map(.prompt_head // empty) | last),
+        last_event: (last | .event),
+        ts: (last | .ts),
+        state: (reduce .[] as $e (null; step(.; $e)))
+      })
+    | sort_by(.ts) | reverse | .[]
+    | if $as_json == 1 then tojson
+      else "\(ts_local)  \(.agent | pad(11)) \(.state | pad(9)) \(short_sid)  \(base | pad(20)) \(.last_event | pad(20)) \(.prompt_head // "")"
+      end'
+  [ "$as_json" = 1 ] || echo "* state 由事件顺序粗略推断，仅供调试。"
+}
+
+cmd_summary() {
+  for a in $AGENTS; do
+    f="$EVENTS_DIR/$a.jsonl"
+    if [ ! -s "$f" ]; then
+      printf '\n%s：尚无事件\n' "$a"
+      continue
+    fi
+    "$JQ" -nrR "$JQ_LIB"'
+      load as $evs
+      | "\n\($evs[0].agent)：\($evs | length) 条事件，\($evs | map(.session_id // empty) | unique | length) 个会话，最近 \($evs | max_by(.ts) | ts_local)",
+        ($evs | group_by(.event) | sort_by(-length)[]
+          | "  \(.[0].event | pad(22)) ×\(length | tostring | pad(6)) 最近 \(max_by(.ts) | ts_local)"),
+        ([$evs[] | select(classify == "waiting")] as $w
+          | if ($w | length) == 0 then "  等待/审批信号：尚未收到"
+            else "  等待/审批信号：\($w | length) 次，最近 \($w | max_by(.ts) | ts_local)（\($w | map(.event) | unique | join(", "))）"
+            end)' < "$f"
+  done
+}
+
+ok() { printf '  ✓ %s\n' "$*"; }
+bad() { printf '  ✗ %s\n' "$*"; }
+note() { printf '  ! %s\n' "$*"; }
+
+count_ours() {
+  "$JQ" '[.. | objects | select(has("command")) | select(.command | tostring | contains("pitwall-hook"))] | length' "$1" 2>/dev/null || echo 0
+}
+
+check_cfg() { # <agent> <配置文件> <期望个数>
+  if [ ! -e "$2" ]; then bad "$1：$2 不存在"; return; fi
+  c=$(count_ours "$2")
+  if [ "$c" = "$3" ]; then ok "$1：$c 个 hook 已登记（$2）"; else bad "$1：登记了 $c 个，期望 $3（$2）→ 重跑 collector/install.sh install $1"; fi
+}
+
+# Devin 只认这 8 个事件（同 install.sh 的 DEVIN_EVENTS）；hooks 里有别的事件名时整段忽略。
+check_devin_events() { # <配置文件>
+  [ -e "$1" ] || return 0
+  extra=$("$JQ" -r '(.hooks // {}) | keys - ["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PermissionRequest","Stop","PostCompaction"] | join(", ")' "$1" 2>/dev/null) || extra=''
+  [ -z "$extra" ] || bad "devin：hooks 含 Devin 不认识的事件（$extra），Devin 会忽略全部 hooks"
+}
+
+codex_bin() {
+  for c in /Applications/ChatGPT.app/Contents/Resources/codex "$(command -v codex 2>/dev/null || true)"; do
+    if [ -n "$c" ] && [ -x "$c" ] && "$c" --version >/dev/null 2>&1; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 用 Codex 官方 app-server 的 hooks/list 读取 hook 解析结果与信任状态（只读）。
+check_codex_trust() {
+  cx=$(codex_bin) || { note "codex：找不到可用的 codex 可执行文件，无法检查信任状态"; return; }
+  init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"pitwall-doctor","title":"pitwall doctor","version":"0.1.0"}}}'
+  list=$("$JQ" -nc --arg cwd "$HOME" '{jsonrpc: "2.0", id: 2, method: "hooks/list", params: {cwds: [$cwd]}}')
+  resp=$({ printf '%s\n' "$init"; sleep 2
+           printf '%s\n' '{"jsonrpc":"2.0","method":"initialized","params":{}}' "$list"; sleep 4
+         } | "$cx" app-server --listen stdio:// 2>/dev/null | "$JQ" -c 'select(.id == 2)' 2>/dev/null | head -n 1)
+  if [ -z "$resp" ]; then note "codex：hooks/list 无响应，无法确认信任状态"; return; fi
+  printf '%s' "$resp" | "$JQ" -r '
+    if .error then "  ✗ codex hooks/list 出错：\(.error.message // .error)"
+    else
+      [.result.data[]? | .errors[]?] as $errs
+      | [.result.data[]? | .warnings[]?] as $warns
+      | [.result.data[]? | .hooks[]? | select((.command // "") | contains("pitwall-hook"))] as $ours
+      | ($errs[] | "  ✗ codex 配置解析错误 \(.path)：\(.message)"),
+        ($warns[] | "  ! codex 加载提示：\(.)"),
+        ( if ($ours | length) == 0 then "  ✗ codex：hooks/list 里没有 pitwall hook"
+          else ($ours | group_by(.trustStatus) | map("\(.[0].trustStatus)×\(length)") | join(" ")) as $t
+            | if all($ours[]; .trustStatus == "trusted" or .trustStatus == "managed")
+              then "  ✓ codex：\($ours | length) 个 hook 已被 Codex 识别并信任（\($t)）"
+              else "  ! codex：\($ours | length) 个 hook 已被 Codex 识别，信任状态 \($t) → 在 Codex 里打开 /hooks 信任后才会运行"
+              end
+          end)
+    end'
+}
+
+cmd_doctor() {
+  echo "基础"
+  if [ -x "$JQ" ]; then ok "jq：$("$JQ" --version)"; else bad "缺少 /usr/bin/jq"; fi
+  if [ -x "$PW_HOME/bin/pitwall-hook" ]; then ok "hook 脚本：$PW_HOME/bin/pitwall-hook"; else bad "hook 脚本未安装"; fi
+  echo "hook 登记"
+  check_cfg claude-code "$HOME/.claude/settings.json" 12
+  check_cfg codex "$HOME/.codex/hooks.json" 7
+  check_cfg cursor "$HOME/.cursor/hooks.json" 6
+  check_cfg devin "$HOME/.config/devin/config.json" 8
+  check_devin_events "$HOME/.config/devin/config.json"
+  if [ -e "$HOME/.pi/agent/extensions/pitwall.ts" ]; then ok "pi：扩展已安装（$HOME/.pi/agent/extensions/pitwall.ts）"; else bad "pi：扩展未安装"; fi
+  echo "Codex 信任状态"
+  check_codex_trust
+  if [ -d "$HOME/.cc-switch" ]; then
+    note "检测到 CC Switch：切换供应商时可能重写 ~/.claude/settings.json 或 ~/.codex/config.toml，切换后请重跑 doctor"
+  fi
+  echo "最近事件"
+  for a in $AGENTS; do
+    f="$EVENTS_DIR/$a.jsonl"
+    if [ -s "$f" ]; then
+      ok "$a：$(tail -n 1 "$f" | "$JQ" -r "$JQ_LIB"'"\(ts_local) \(.event)"' 2>/dev/null)（共 $(wc -l < "$f" | tr -d ' ') 条）"
+    else
+      note "$a：尚无事件"
+    fi
+  done
+}
+
+# hooks 子命令用的事件说明；★ 标记等待/审批信号。
+HOOK_DESC='{
+  "waiting": ["PermissionRequest", "Notification", "Elicitation", "ui_prompt_start"],
+  "text": {
+    "SessionStart": "会话开始或恢复", "SessionEnd": "会话结束",
+    "UserPromptSubmit": "提交 prompt（任务开始）",
+    "PreToolUse": "工具执行前", "PostToolUse": "工具执行后", "PostToolUseFailure": "工具执行失败",
+    "PermissionRequest": "弹出权限审批，等待你处理", "PermissionDenied": "权限被拒绝",
+    "Notification": "通知，含等待审批/等待输入", "Elicitation": "MCP 工具请求你输入",
+    "Stop": "本轮回复结束", "StopFailure": "本轮因错误结束", "PostCompaction": "上下文压缩完成",
+    "sessionStart": "会话开始", "sessionEnd": "会话结束", "beforeSubmitPrompt": "提交 prompt（任务开始）",
+    "postToolUse": "工具执行后", "postToolUseFailure": "工具执行失败", "stop": "本轮结束（成功/出错/中止）",
+    "session_start": "会话开始", "session_shutdown": "会话关闭", "before_agent_start": "提交 prompt（任务开始）",
+    "agent_start": "开始运行", "tool_execution_start": "工具执行前", "tool_execution_end": "工具执行后",
+    "ui_prompt_start": "弹出确认/输入框，等待你处理", "ui_prompt_end": "确认/输入框关闭",
+    "message_end": "本轮回复结束（只记 stop/error/aborted）", "agent_end": "一次运行结束",
+    "agent_settled": "不再自动继续，本轮结束"
+  }
+}'
+
+# list_cfg <agent> <配置文件> <nested|flat> <说明>：列出该配置里 pitwall 的 hook（只读）。
+list_cfg() {
+  echo
+  if [ ! -f "$2" ]; then
+    printf '%s：%s 不存在\n' "$1" "$2"
+    return
+  fi
+  "$JQ" -r --arg agent "$1" --arg file "$2" --arg shape "$3" --arg note "$4" --arg home "$HOME" \
+    --argjson d "$HOOK_DESC" "$JQ_LIB"'
+    def ours: (.command // "") | tostring | contains("pitwall-hook");
+    def handlers: if $shape == "nested" then (.matcher as $m | .hooks[]? | . + {matcher: $m}) else . end;
+    [ .hooks // {} | to_entries[] | .key as $ev | .value[]? | handlers | select(ours) | . + {ev: $ev} ] as $mine
+    | [ .hooks // {} | .[][]? | handlers | select(ours | not) ] as $others
+    | "\($agent)  \($file | if startswith($home) then "~" + ltrimstr($home) else . end)（\($mine | length) 个）",
+      "  \($note)",
+      ( $mine[]
+        | "  \(.ev as $ev | if ($d.waiting | index($ev)) != null then "★" else " " end) \(.ev | pad(20)) \(($d.text[.ev] // "") | pad(16))  "
+          + ([ (if (.matcher // "") != "" then "matcher=\(.matcher)" else empty end),
+               (if $shape == "flat" then empty elif .async then "异步" else "同步" end),
+               (if .timeout then "超时 \(.timeout)s" else empty end) ] | join("  ")) ),
+      (if ($mine | length) > 0 then "  调用：\($mine[0].command | sub(" [^ ]+ [^ ]+$"; "")) <agent> <事件>" else empty end),
+      (if ($others | length) > 0 then "  另有 \($others | length) 个其他来源的 hook（pitwall 不改动）" else empty end)
+  ' "$2"
+}
+
+# 列出 pitwall 在各 agent 里登记了哪些 hook，以及脚本本身做什么、记录什么。
+cmd_hooks() {
+  hook="$PW_HOME/bin/pitwall-hook"
+  ext="$HOME/.pi/agent/extensions/pitwall.ts"
+  echo "hook 脚本"
+  if [ -f "$hook" ]; then
+    printf '  %s  sha256 %s…\n' "$hook" "$(shasum -a 256 "$hook" | cut -c1-16)"
+  else
+    printf '  ✗ 未安装：%s\n' "$hook"
+  fi
+  echo "  作用：把收到的事件脱敏后追加一行到 $EVENTS_DIR/<agent>.jsonl；"
+  echo "        不写 stdout、总是返回成功，所以不会批准或拒绝审批、不会阻塞，也不会往 agent 上下文里加内容。"
+  echo "  记录：时间、agent、事件名、会话/轮次 id、工作目录、工具名、通知类型、状态与错误摘要、"
+  echo "        prompt 首个非空行的前 80 字、payload 字段名、进程与终端线索（供以后返回原会话）。"
+  echo "  不记录：prompt 其余内容、工具参数与输出、assistant 回复、transcript 内容、邮箱等账号信息。"
+  echo "  查看脚本：open -e $hook"
+  list_cfg claude-code "$HOME/.claude/settings.json" nested "Claude Code CLI 与桌面版共用；异步执行，不阻塞"
+  list_cfg codex "$HOME/.codex/hooks.json" nested "Codex Desktop 与 CLI 共用；在 Codex 设置 → 钩子 里信任后才运行（信任状态见 doctor）"
+  list_cfg cursor "$HOME/.cursor/hooks.json" flat "Cursor IDE 与 cursor-agent 共用；只记录，不做决策"
+  list_cfg devin "$HOME/.config/devin/config.json" nested "Devin for Terminal（devin CLI）；只记录，不做决策。PermissionRequest 也会在无人值守时触发，不代表一定在等你"
+  echo
+  if [ -f "$ext" ]; then
+    printf 'pi  %s  sha256 %s…\n' "$ext" "$(shasum -a 256 "$ext" | cut -c1-16)"
+    echo "  Pi 扩展，在 Pi 进程内订阅以下事件；不拦截工具、不改 prompt、不回答确认框"
+    grep -o 'pi\.on("[a-z_]*"' "$ext" | sed 's/pi\.on("\(.*\)"/\1/' |
+      "$JQ" -Rr --argjson d "$HOOK_DESC" "$JQ_LIB"'. as $e | "  \(if ($d.waiting | index($e)) != null then "★" else " " end) \($e | pad(20)) \($d.text[$e] // "")"'
+    echo "  查看扩展：open -e $ext"
+  else
+    echo "pi：扩展未安装"
+  fi
+  echo
+  echo "★ = 等待/审批信号"
+}
+
+
+# 验证原型：只接受完整且唯一的 session id，不按 repo/标题猜测，不执行未知 URL。
+cmd_jump() {
+  [ "$#" = 1 ] || { echo "用法：pitwall-events jump <完整 session-id>" >&2; return 2; }
+  # 旧 spool 里可能有空 id 的事件；空 / 纯空白 id 会把无关会话并成一个，直接拒绝。
+  case $1 in
+    *[![:space:]]*) ;;
+    *) echo "session id 为空，拒绝猜测" >&2; return 2 ;;
+  esac
+  files=$(spools)
+  [ -n "$files" ] || { echo "没有事件，无法定位会话" >&2; return 1; }
+  # shellcheck disable=SC2086
+  cat $files | "$JQ" -nerR --arg sid "$1" "$JQ_LIB"'
+    load | map(select(.session_id == $sid)) | group_by(.agent) |
+    if length != 1 then error("会话不存在或跨 Agent 身份冲突；拒绝猜测")
+    else .[0] | sort_by(.ts) | {
+      agent: .[0].agent, session_id: .[0].session_id,
+      cwd: (map(.cwd // empty) | last),
+      transcript_path: (map(.transcript_path // empty) | last),
+      terminal: (map(.ctx.term_program // empty) | last),
+      result: "降级：精准跳转未验证。请手动打开原应用，复制 session_id / cwd 查找；不会新建会话或执行命令。"
+    } end'
+}
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  tail) cmd_tail "$@" ;;
+  hooks) cmd_hooks ;;
+  status) cmd_status "$@" ;;
+  summary) cmd_summary ;;
+  doctor) cmd_doctor ;;
+  jump) cmd_jump "$@" ;;
+  -h | --help | help) usage ;;
+  *) usage; exit 2 ;;
+esac

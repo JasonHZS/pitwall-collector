@@ -1,0 +1,45 @@
+name: Support a new agent
+description: Ask for, or offer to add, collector support for another coding agent
+labels: [new agent]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read [CONTRIBUTING.md](https://github.com/JasonHZS/pitwall-collector/blob/main/CONTRIBUTING.md) first. Answer what you can; "don't know" is a fine answer.
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      placeholder: Name, and a link to its documentation
+    validations:
+      required: true
+  - type: input
+    id: forms
+    attributes:
+      label: Forms and versions you use
+      placeholder: CLI 1.4, desktop app 0.9 …
+    validations:
+      required: true
+  - type: textarea
+    id: observe
+    attributes:
+      label: How can it be observed?
+      description: Hooks, an extension or plugin API, or files it writes (session logs, transcripts). Links to the docs help.
+    validations:
+      required: true
+  - type: textarea
+    id: signals
+    attributes:
+      label: Which events mean what?
+      description: |
+        Which events show that a request started, that the agent waits for you (approval or input), and that a request finished, failed or was cancelled? How sure are you about each?
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you like to implement it?
+      options:
+        - Yes, I'd like to open a pull request
+        - Maybe, with some guidance
+        - No, I'm requesting it
+    validations:
+      required: true
