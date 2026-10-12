@@ -200,8 +200,26 @@ prune_backups() {
     while read -r old; do rm -rf "${dir:?}/$old"; done
 }
 
+# Bilingual, unlike the rest of the output: this is what a first run without arguments shows.
 usage() {
-  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+  name=$(basename "$0")
+  cat <<EOF
+Install or remove Pitwall's event collection.
+安装或卸载 Pitwall 的事件采集。
+
+  $name install   [claude-code] [codex] [cursor] [pi] [devin]   # no agents = all / 不带参数 = 全部
+  $name uninstall [claude-code] [codex] [cursor] [pi] [devin]
+
+install copies the hook scripts and the event viewer to ~/.pitwall/bin/ and registers Pitwall's
+hooks in each agent's global config. Entries already up to date stay where they are, missing or
+outdated ones are replaced, and other hooks are left alone; running it again changes nothing.
+install：把 hook 脚本和查看工具复制到 ~/.pitwall/bin/，然后在各 agent 的全局配置里登记 pitwall 的
+hook：已登记且一致的条目原样保留，缺失或过时的才替换，其它 hook 原样保留；重复执行结果不变。
+
+Before any agent config is changed, the original is backed up to ~/.pitwall/backups/<time>/
+(the 10 most recent are kept).
+任何 agent 配置被改动前，原文件先备份到 ~/.pitwall/backups/<时间>/，只保留最近 10 份。
+EOF
 }
 
 cmd=${1:-}
