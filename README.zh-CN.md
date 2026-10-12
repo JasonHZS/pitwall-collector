@@ -17,22 +17,27 @@ Coding Agent 的维修墙。Pitwall 是一个本地 macOS 看板，统一查看 
 
 需要 macOS 15 或更新版本。
 
-从 [Releases](https://github.com/JasonHZS/pitwall-collector/releases/latest) 下载 `Pitwall.dmg`，打开后把 Pitwall 拖进“应用程序”。
+```sh
+brew install --cask jasonhzs/tap/pitwall
+pitwall-collector install
+```
 
-然后为要监督的 Agent 安装事件采集。安装器随 App 附带，修改各 Agent 的配置前会自动备份：
+第二条命令为要监督的 Agent 安装事件采集；安装器随 App 附带，修改各 Agent 的配置前会自动备份。不带参数会为所有支持的 Agent 安装，只装其中几个时在后面列出，例如 `pitwall-collector install codex claude-code`。升级用 `brew upgrade --cask pitwall`。
+
+也可以从 [Releases](https://github.com/JasonHZS/pitwall-collector/releases/latest) 下载 `Pitwall.dmg`，拖进“应用程序”。不用 Homebrew 时没有 `pitwall-collector` 命令，改为按路径运行 App 内附带的安装器（Pitwall 设置页里列出了每个 Agent 对应的命令）：
 
 ```sh
 sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh install
 ```
 
-不带参数会为所有支持的 Agent 安装；只装其中几个时在后面列出，例如 `install codex claude-code`。Pitwall 设置页里也列出了每个 Agent 对应的命令，可直接复制。从本仓库安装则运行 `sh collector/install.sh install`。
+从本仓库安装则运行 `sh collector/install.sh install`。
 
 **Codex 需要手动信任一次新 hook。** 打开 Codex CLI，输入 `/hooks`，信任 pitwall 的 hook。新开的 Agent 会话生效；已打开的 Pi 会话可运行 `/reload`。
 
 移除 Pitwall 的 hook 和扩展（事件文件与备份会保留）：
 
 ```sh
-sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh uninstall
+pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh uninstall
 ```
 
 ## 支持的 Agent

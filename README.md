@@ -17,22 +17,27 @@ The collector is open so you can check exactly what it records, and so support f
 
 Requires macOS 15 or later.
 
-Download `Pitwall.dmg` from [Releases](https://github.com/JasonHZS/pitwall-collector/releases/latest), open it and drag Pitwall to Applications.
+```sh
+brew install --cask jasonhzs/tap/pitwall
+pitwall-collector install
+```
 
-Then enable event collection for the agents you use. The installer is bundled in the app and backs up each agent's config before changing it:
+The second command enables event collection for the agents you use; the installer is bundled in the app and backs up each agent's config before changing it. Without arguments it sets up every supported agent; to pick some, list them, e.g. `pitwall-collector install codex claude-code`. Upgrade with `brew upgrade --cask pitwall`.
+
+Or download `Pitwall.dmg` from [Releases](https://github.com/JasonHZS/pitwall-collector/releases/latest) and drag Pitwall to Applications. Without Homebrew there is no `pitwall-collector` command; run the bundled installer by its path instead (Pitwall's Settings lists the command for each agent):
 
 ```sh
 sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh install
 ```
 
-Without arguments it sets up every supported agent; to pick some, list them, e.g. `install codex claude-code`. Pitwall's Settings lists the command for each agent, ready to copy. To work from this repository, run `sh collector/install.sh install`.
+To work from this repository, run `sh collector/install.sh install`.
 
 **Codex asks you to trust new hooks once.** Open the Codex CLI, type `/hooks` and trust the pitwall hooks. New agent sessions pick up the hooks; in an open Pi session, run `/reload`.
 
 To remove Pitwall's hooks and extension again (event files and backups stay):
 
 ```sh
-sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh uninstall
+pitwall-collector uninstall   # or, with the DMG: sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh uninstall
 ```
 
 ## Supported agents
