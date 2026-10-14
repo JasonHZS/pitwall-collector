@@ -41,10 +41,16 @@ jqcheck "claude：保留用户 Stop hook" "$C" '[.hooks.Stop[].hooks[].command] 
 check "claude：12 个 pitwall hook" test "$(count_ours "$C")" = 12
 jqcheck "claude：全部 async" "$C" '[.. | objects | select(has("command")) | select(.command | contains("pitwall-hook")) | .async] | all'
 jqcheck "claude：工具类事件带 matcher *" "$C" '[.hooks.PreToolUse[] | select(.hooks[0].command | contains("pitwall-hook")) | .matcher] == ["*"]'
-jqcheck "claude：PermissionRequest 已登记" "$C" '.hooks.PermissionRequest | length == 1'
-check "codex：7 个 pitwall hook" test "$(count_ours "$X")" = 7
+jqcheck "claude：PermissionRequest 登记采集与审批两个 hook" "$C" '.hooks.PermissionRequest | length == 2'
+jqcheck "claude：审批 hook 同步执行，timeout 长于脚本上限" "$C" '[.hooks.PermissionRequest[].hooks[] | select(.command | contains("pitwall-approval"))] == [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval claude-code", timeout: 960}]'
+jqcheck "claude：审批 hook 只登记在 PermissionRequest" "$C" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] == ["PermissionRequest"]'
+check "审批脚本可执行" test -x "$PITWALL_HOME/bin/pitwall-approval"
+check "codex：8 个事件 hook" test "$(count_ours "$X")" = 8
 jqcheck "codex：保留用户 hook" "$X" '[.hooks.Stop[].hooks[].command] | index("/usr/bin/true user-hook") != null'
 jqcheck "codex：SessionEnd 不设 async（Codex 不支持）" "$X" '.hooks.SessionEnd[0].hooks[0] | has("async") | not'
+jqcheck "codex：审批 hook 同步执行，timeout 长于脚本上限" "$X" '[.hooks.PermissionRequest[].hooks[] | select(.command | contains("pitwall-approval"))] == [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval codex", timeout: 65}]'
+jqcheck "codex：审批 hook 只登记在 PermissionRequest" "$X" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] == ["PermissionRequest"]'
+jqcheck "codex：Interrupt 同步执行，3 秒上限" "$X" '.hooks.Interrupt[0].hooks[0] | .timeout == 3 and (has("async") | not)'
 check "cursor：6 个 pitwall hook" test "$(count_ours "$R")" = 6
 jqcheck "cursor：保留用户 hook 与 version" "$R" '.version == 1 and ([.hooks.stop[].command] | index("/usr/bin/true user-hook") != null)'
 jqcheck "cursor：不注册带决策语义的 before* 权限 hook" "$R" '.hooks | has("beforeShellExecution") or has("beforeMCPExecution") or has("preToolUse") | not'
@@ -54,7 +60,10 @@ check "devin：8 个 pitwall hook" test "$(count_ours "$D")" = 8
 jqcheck "devin：保留模型、权限与用户 hook" "$D" '.agent.model == "swe-2" and .permissions.allow == ["Read(**)"] and ([.hooks.Stop[].hooks[].command] | index("/usr/bin/true user-devin-hook") != null)'
 # Devin 遇到未知事件名会整段忽略 hooks（包括用户自己的），所以只能登记它认识的 8 个。
 jqcheck "devin：只登记 Devin 认识的事件" "$D" '.hooks | keys - ["PreToolUse","PostToolUse","UserPromptSubmit","Stop","PostCompaction","SessionStart","SessionEnd","PermissionRequest"] == []'
-jqcheck "devin：不写 async / matcher" "$D" '[.hooks[][] | select(any(.hooks[]?; .command | contains("pitwall-hook"))) | (has("matcher") or any(.hooks[]; has("async")))] | any | not'
+jqcheck "devin：不写 async / matcher" "$D" '[.hooks[][] | select(any(.hooks[]?; .command | test("pitwall-(hook|approval)"))) | (has("matcher") or any(.hooks[]; has("async")))] | any | not'
+jqcheck "devin：PermissionRequest 登记采集与审批两个 hook" "$D" '.hooks.PermissionRequest | length == 2'
+jqcheck "devin：审批 hook 同步执行，timeout 长于脚本 60 秒上限" "$D" '[.hooks.PermissionRequest[].hooks[] | select(.command | contains("pitwall-approval"))] == [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval devin", timeout: 65}]'
+jqcheck "devin：审批 hook 只登记在 PermissionRequest" "$D" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] == ["PermissionRequest"]'
 
 sums() { shasum "$C" "$X" "$R" "$D" "$HOME/.pi/agent/extensions/pitwall.ts"; }
 before=$(sums)
@@ -229,9 +238,9 @@ check "devin Stop → done" test "$(state devin devin-sess-1)" = done
 check "status 表格可运行" "$EVENTS" status
 check "tail 可运行" "$EVENTS" tail -n 5
 "$EVENTS" hooks > "$tmp/hooks.txt" 2>&1 || fail "hooks 运行出错"
-check "hooks：列出三处配置的 hook 数" sh -c "grep -q 'settings.json（12 个）' '$tmp/hooks.txt' && grep -q 'codex/hooks.json（7 个）' '$tmp/hooks.txt' && grep -q 'cursor/hooks.json（6 个）' '$tmp/hooks.txt'"
+check "hooks：列出三处配置的采集与审批 hook 数" sh -c "grep -q 'settings.json（13 个）' '$tmp/hooks.txt' && grep -q 'codex/hooks.json（9 个）' '$tmp/hooks.txt' && grep -q 'cursor/hooks.json（6 个）' '$tmp/hooks.txt'"
 check "hooks：列出 pi 扩展订阅的事件" grep -q ui_prompt_start "$tmp/hooks.txt"
-check "hooks：列出 devin 配置的 hook 数" grep -q 'devin/config.json（8 个）' "$tmp/hooks.txt"
+check "hooks：列出 devin 配置的采集与审批 hook 数" grep -q 'devin/config.json（9 个）' "$tmp/hooks.txt"
 check "hooks：PermissionRequest 标为等待信号" grep -q '★ PermissionRequest' "$tmp/hooks.txt"
 check "hooks：提示其他来源的 hook" grep -q '另有 1 个其他来源的 hook' "$tmp/hooks.txt"
 check "summary：claude/codex/pi/devin 各报告 1 次等待/审批信号" test "$("$EVENTS" summary | grep -c '等待/审批信号：1 次')" = 4
@@ -285,10 +294,163 @@ check "最旧的备份被删除" test ! -e "$B/20200101-000010"
 check "本次安装的备份保留" sh -c "ls '$B' | grep -v '^2020' | grep -qE '^[0-9]{8}-[0-9]{6}$'"
 check "非备份目录与文件不被删除" sh -c "test -d '$B/keep-me' && test -f '$B/notes.txt'"
 
+echo "审批 hook"
+APPROVAL="$PITWALL_HOME/bin/pitwall-approval"
+APPR="$PITWALL_HOME/approvals"
+req='{"session_id":"appr-sess","cwd":"/tmp/proj-a","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"touch x"},"permission_mode":"default"}'
+out=$(printf '%s' "$req" | "$APPROVAL" claude-code)
+check "Pitwall 未在监听：无输出、不留请求" sh -c "test -z '$out' && test ! -d '$APPR/requests' -o -z \"\$(ls -A '$APPR/requests' 2>/dev/null)\""
+mkdir -p "$APPR" && touch "$APPR/listening"
+# 后台等待，等请求文件出现后写入决定。
+await_request() { i=0; while [ $i -lt 50 ]; do set -- "$APPR"/requests/appr-sess.Bash.*.json; [ -e "$1" ] && { printf '%s' "$1"; return 0; }; sleep 0.1; i=$((i + 1)); done; return 1; }
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/approve.out" &
+pid=$!
+reqfile=$(await_request) || reqfile=""
+check "监听时写出请求文件（含会话与工具）" test -n "$reqfile"
+jqcheck "请求文件含完整工具输入" "${reqfile:-/dev/null}" '.tool_name == "Bash" and .tool_input.command == "touch x" and .session_id == "appr-sess" and (.pid | type) == "number"'
+id=$(basename "${reqfile:-x.x.none.json}" .json); id=${id#appr-sess.Bash.}
+printf 'allow' > "$APPR/decisions/$id"
+wait $pid
+jqcheck "Pitwall 批准 → 输出 allow" "$tmp/approve.out" '.hookSpecificOutput == {hookEventName: "PermissionRequest", decision: {behavior: "allow"}}'
+check "回答后清理请求与决定" sh -c "test ! -e '$reqfile' && test ! -e '$APPR/decisions/$id'"
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/deny.out" &
+pid=$!
+reqfile=$(await_request) || reqfile=""
+id=$(basename "${reqfile:-x.x.none.json}" .json); id=${id#appr-sess.Bash.}
+printf 'deny' > "$APPR/decisions/$id"
+wait $pid
+jqcheck "Pitwall 拒绝 → 输出 deny 与说明" "$tmp/deny.out" '.hookSpecificOutput.decision.behavior == "deny" and (.hookSpecificOutput.decision.message | length) > 0'
+# 终端里先回答：同一会话同一工具的 PostToolUse 撤回请求，审批脚本无输出退出。
+printf '%s' '{"session_id":"appr-sess"}' | "$HOOK" claude-code SessionEnd
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/withdrawn.out" &
+pid=$!
+reqfile=$(await_request) || reqfile=""
+printf '%s' '{"session_id":"appr-sess","hook_event_name":"PostToolUse","tool_name":"Read"}' | "$HOOK" claude-code PostToolUse
+check "其它工具的事件不撤回请求" test -e "${reqfile:-/nonexistent}"
+printf '%s' '{"session_id":"appr-sess","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"touch x"}}' | "$HOOK" claude-code PostToolUse
+wait $pid
+check "同一调用的事件撤回请求，审批脚本无输出退出" sh -c "test ! -e '$reqfile' && test ! -s '$tmp/withdrawn.out'"
+# 并行调用同名工具：完成一条只撤回那条；旧事件迟到也不能撤回输入不同的新请求。
+printf '%s' '{"session_id":"appr-sess"}' | "$HOOK" claude-code SessionEnd
+await_request_count() {
+  expected=$1; i=0
+  while [ $i -lt 50 ]; do
+    set -- "$APPR"/requests/appr-sess.Bash.*.json
+    [ -e "$1" ] && [ $# -eq "$expected" ] && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+touch "$APPR/listening"
+second_req=$(printf '%s' "$req" | "$JQ" -c '.tool_input.command = "touch y"')
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/parallel-first.out" &
+first_pid=$!
+printf '%s' "$second_req" | "$APPROVAL" claude-code > "$tmp/parallel-second.out" &
+second_pid=$!
+check "同一会话的两条 Bash 请求同时存在" await_request_count 2
+first_file=$("$JQ" -r 'select(.tool_input.command == "touch x") | input_filename' "$APPR"/requests/*.json)
+second_file=$("$JQ" -r 'select(.tool_input.command == "touch y") | input_filename' "$APPR"/requests/*.json)
+printf '%s' "$req" | "$HOOK" claude-code PostToolUse
+wait $first_pid
+check "完成一条 Bash 只撤回那条请求" sh -c "test ! -e '$first_file' && test -e '$second_file' && test ! -s '$tmp/parallel-first.out'"
+printf '%s' "$req" | "$HOOK" claude-code PostToolUse
+check "旧的 Bash 事件迟到不撤回另一条待批请求" test -e "$second_file"
+id=$("$JQ" -r '.id' "$second_file")
+printf 'allow' > "$APPR/decisions/$id"
+wait $second_pid
+jqcheck "保留的第二条请求仍可批准" "$tmp/parallel-second.out" '.hookSpecificOutput.decision.behavior == "allow"'
+# 第一条已回答且清理之后，又请求相同输入：旧完成事件仍不能撤回新的那条。
+touch "$APPR/listening"
+printf '%s' "$second_req" | "$APPROVAL" claude-code > "$tmp/repeated.out" &
+pid=$!
+reqfile=$(await_request) || reqfile=""
+printf '%s' "$second_req" | "$HOOK" claude-code PostToolUse
+check "已处理的同输入请求的迟到事件不撤回新请求" test -e "$reqfile"
+id=$("$JQ" -r '.id' "$reqfile")
+printf 'deny' > "$APPR/decisions/$id"
+wait $pid
+jqcheck "无法确认归属的重复请求仍可由用户拒绝" "$tmp/repeated.out" '.hookSpecificOutput.decision.behavior == "deny"'
+# 完整输入的指纹不依赖显示用的 4000 字截断，JSON 字段顺序也不影响匹配。
+touch "$APPR/listening"
+long_req=$(printf '%s' "$req" | "$JQ" -c '.tool_input = {command: (([range(4500) | "x"] | join("")) + "first"), description: "long command"}')
+other_long_req=$(printf '%s' "$long_req" | "$JQ" -c '.tool_input.command |= sub("first$"; "second")')
+printf '%s' "$long_req" | "$APPROVAL" claude-code > "$tmp/long.out" &
+pid=$!
+reqfile=$(await_request) || reqfile=""
+jqcheck "长输入显示截断但保留完整输入的指纹" "$reqfile" '.tool_input._truncated != null and (.tool_input_sha256 | test("^[a-f0-9]{64}$"))'
+printf '%s' "$other_long_req" | "$HOOK" claude-code PostToolUse
+check "相同显示前缀、不同完整输入不会误撤回" test -e "$reqfile"
+printf '%s' "$long_req" | "$JQ" -c '.tool_input = {description: .tool_input.description, command: .tool_input.command}' | "$HOOK" claude-code PostToolUse
+wait $pid
+check "JSON 字段换序仍撤回同一完整输入的请求" sh -c "test ! -e '$reqfile' && test ! -s '$tmp/long.out'"
+# 相同输入无法唯一匹配时不猜；有调用 ID 则只撤回对应的那条。
+touch "$APPR/listening"
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/identical-first.out" &
+first_pid=$!
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/identical-second.out" &
+second_pid=$!
+check "相同输入的两个请求同时存在" await_request_count 2
+printf '%s' "$req" | "$HOOK" claude-code PostToolUse
+check "无法唯一关联时保留两个相同输入的请求" await_request_count 2
+printf '%s' '{"session_id":"appr-sess"}' | "$HOOK" claude-code Stop
+wait $first_pid; wait $second_pid
+touch "$APPR/listening"
+first_req=$(printf '%s' "$req" | "$JQ" -c '.tool_use_id = "call-first"')
+second_req=$(printf '%s' "$req" | "$JQ" -c '.tool_use_id = "call-second"')
+printf '%s' "$first_req" | "$APPROVAL" claude-code > "$tmp/identified-first.out" &
+first_pid=$!
+printf '%s' "$second_req" | "$APPROVAL" claude-code > "$tmp/identified-second.out" &
+second_pid=$!
+check "有调用 ID 的两个相同输入请求同时存在" await_request_count 2
+first_file=$("$JQ" -r 'select(.tool_use_id == "call-first") | input_filename' "$APPR"/requests/*.json)
+second_file=$("$JQ" -r 'select(.tool_use_id == "call-second") | input_filename' "$APPR"/requests/*.json)
+printf '%s' "$first_req" | "$HOOK" claude-code PostToolUse
+wait $first_pid
+check "调用 ID 只撤回对应请求，即使输入完全相同" sh -c "test ! -e '$first_file' && test -e '$second_file'"
+printf '%s' '{"session_id":"appr-sess"}' | "$HOOK" claude-code Stop
+wait $second_pid
+printf '%s' '{"session_id":"appr-sess"}' | "$HOOK" claude-code SessionEnd
+check "会话结束清理审批关联标记" sh -c "test -z \"\$(ls -A '$APPR/requests')\""
+touch "$APPR/listening"
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/stop.out" &
+pid=$!
+reqfile=$(await_request) || reqfile=""
+printf '%s' '{"session_id":"appr-sess","hook_event_name":"Stop"}' | "$HOOK" claude-code Stop
+wait $pid
+check "轮次结束撤回整个会话的请求" sh -c "test ! -e '$reqfile' && test ! -s '$tmp/stop.out'"
+# Pitwall 退出（监听文件过期）后，等待中的审批脚本自行退出。
+printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/stale.out" &
+pid=$!
+reqfile=$(await_request) || reqfile=""
+touch -t "$(date -v-1M +%Y%m%d%H%M.%S)" "$APPR/listening"
+wait $pid
+check "监听过期：无输出退出并删除请求" sh -c "test ! -e '$reqfile' && test ! -s '$tmp/stale.out'"
+check "Codex 缺少当前轮 metadata 时直接退出" test -z "$(printf '%s' "$req" | "$APPROVAL" codex)"
+sh "$root/tests/codex-approval.sh" || fails=$((fails + 1))
+sh "$root/tests/devin-approval.sh" || fails=$((fails + 1))
+sh "$root/tests/pi-approval.sh" || fails=$((fails + 1))
+
 echo "损坏的配置不被覆盖"
 printf '{ not json' > "$R"
 sh "$root/install.sh" install cursor >/dev/null 2>&1 || true
 check "非法 JSON 保持原样" test "$(cat "$R")" = "{ not json"
+# 一个 agent 失败只跳过它自己：排在后面的 agent 照常安装，结尾报告失败并以非零退出。
+bad="$tmp/bad-home"
+mkdir -p "$bad/.cursor" "$bad/.pi/agent" "$bad/.config/devin"
+printf '{ not json' > "$bad/.cursor/hooks.json"
+printf '%s\n' '{"hooks":{}}' > "$bad/.config/devin/config.json"
+bad_rc=0
+HOME="$bad" PITWALL_HOME="$bad/.pitwall" sh "$root/install.sh" install cursor pi devin > "$tmp/bad.txt" 2>&1 || bad_rc=$?
+check "有 agent 失败时 install 以非零退出" test "$bad_rc" -ne 0
+check "失败的 agent 配置保持原样" test "$(cat "$bad/.cursor/hooks.json")" = "{ not json"
+check "失败之后的 pi 仍被安装" test -f "$bad/.pi/agent/extensions/pitwall.ts"
+check "失败之后的 devin 仍被安装" test "$(count_ours "$bad/.config/devin/config.json")" = 8
+check "备份提示与后续说明照常输出" sh -c "grep -q 'original configs backed up to' '$tmp/bad.txt' && grep -q 'events go to' '$tmp/bad.txt'"
+check "结尾列出失败的 agent" sh -c "tail -2 '$tmp/bad.txt' | grep -q 'install did not finish for: cursor (' && tail -1 '$tmp/bad.txt' | grep -q '未完成安装：cursor（'"
+bad_rc=0
+HOME="$bad" PITWALL_HOME="$bad/.pitwall" sh "$root/install.sh" uninstall cursor pi devin > "$tmp/bad-un.txt" 2>&1 || bad_rc=$?
+check "有 agent 失败时 uninstall 以非零退出并列出它" sh -c "test $bad_rc -ne 0 && grep -q 'uninstall did not finish for: cursor (' '$tmp/bad-un.txt'"
+check "失败之后的 pi / devin 仍被卸载" sh -c "test ! -e '$bad/.pi/agent/extensions/pitwall.ts' && test \"\$('$JQ' '[.. | objects | select(has(\"command\"))] | length' '$bad/.config/devin/config.json')\" = 0"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "全部通过"; else echo "$fails 项失败"; exit 1; fi

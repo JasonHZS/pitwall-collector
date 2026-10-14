@@ -19,7 +19,7 @@ Pitwall reads the event files described in [docs/event-format.md](docs/event-for
 These are the promises users rely on when they let the collector into their agent configs.
 
 **Observe, never interfere.**
-- A hook never writes to stdout and always exits 0. It must not approve, deny, block, delay or change anything the agent does, and must not add text to the agent's context.
+- An event hook never writes to stdout and always exits 0. It must not approve, deny, block, delay or change anything the agent does, and must not add text to the agent's context. The one exception is `pitwall-approval`, which answers a permission request only after the user clicks Approve or Deny in Pitwall.
 - Register a hook as asynchronous when the agent supports it. When it doesn't, keep the hook fast and give it a short timeout.
 - Don't register hooks whose output the agent treats as a decision (for example "before running a shell command" hooks that can veto the command).
 - An extension handler returns nothing and swallows its own errors.

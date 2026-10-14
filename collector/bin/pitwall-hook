@@ -17,6 +17,11 @@ if [ ! -x "$JQ" ] || ! /bin/mkdir -p "$dir" 2>/dev/null; then
   exit 0
 fi
 
+# 后续异步事件不能撤回在本 hook 启动后才产生的审批请求。
+received_at=''
+case "$agent" in claude-code | codex | devin) received_at=$("$JQ" -n now) ;; esac
+payload=$(/bin/cat)
+
 # 会话开始 / 任务开始时额外记录进程与终端线索，供之后「返回原会话」使用。
 proc='' parent_proc='' ghostty_env=''
 case "$event" in
@@ -140,7 +145,7 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
 end
 '
 
-line=$("$JQ" -c \
+line=$(printf '%s' "$payload" | "$JQ" -c \
   --arg agent "$agent" --arg event "$event" --arg ppid "$PPID" \
   --arg proc "$proc" --arg parent_proc "$parent_proc" --arg ghostty_env "$ghostty_env" \
   --arg term_program "${TERM_PROGRAM:-}" --arg term_session_id "${TERM_SESSION_ID:-}" \
@@ -155,4 +160,69 @@ fi
 
 [ "$line" = '{"_skip":true}' ] && exit 0
 printf '%s\n' "$line" >> "$dir/$agent.jsonl" 2>/dev/null
+
+# 审批请求在终端里先被回答时，用随后的事件撤回 Pitwall 里那条请求，让等待中的
+# pitwall-approval 退出：工具事件只撤回唯一匹配的调用，轮次 / 会话结束撤回整个会话的。
+requests="${PITWALL_HOME:-$HOME/.pitwall}/approvals/requests"
+if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ]; } && [ -d "$requests" ]; then
+  set -- "$requests"/*
+  if [ -e "$1" ]; then
+    session=$(printf '%s' "$line" | "$JQ" -r '
+      .session_id // "" | select(test("^[A-Za-z0-9_.-]{1,128}$"))' 2>/dev/null)
+    kind=$(printf '%s' "$line" | "$JQ" -r '.event // ""' 2>/dev/null)
+    if [ -n "$session" ]; then
+      scope=$session
+      [ "$agent" = claude-code ] || scope="$agent.$session"
+      # Devin 没有 turn_id，每次提交轮换的 prompt_id 就是它的轮次。
+      turn=$(printf '%s' "$line" | "$JQ" -r 'if .agent == "devin" then .prompt_id else .turn_id end // ""' 2>/dev/null)
+      case "$kind" in
+        PostToolUse | PostToolUseFailure | PermissionDenied)
+          set -- "$requests/$scope."*.json
+          [ -e "$1" ] || exit 0
+          canonical=$(printf '%s' "$payload" | "$JQ" -cS '
+            select((.tool_name | type) == "string" and (.tool_input | type) == "object")
+            | [.tool_name, .tool_input]' 2>/dev/null)
+          if [ -n "$canonical" ]; then
+            input_hash=$(printf '%s' "$canonical" | /usr/bin/shasum -a 256 | /usr/bin/cut -d ' ' -f 1)
+            tool=$(printf '%s' "$payload" | "$JQ" -r '.tool_name')
+            call_id=$(printf '%s' "$payload" | "$JQ" -r '.tool_use_id | if type == "string" then . else "" end')
+            unique=false
+            correlation="$requests/$scope.$input_hash.seen"
+            [ -d "$correlation" ] && [ ! -e "$correlation/repeated" ] && unique=true
+            matches=$("$JQ" -r --arg agent "$agent" --arg session "$session" --arg turn "$turn" --arg tool "$tool" --arg call "$call_id" \
+              --arg hash "$input_hash" --argjson unique "$unique" --argjson received "$received_at" '
+              select(.agent == $agent and .session_id == $session and .tool_name == $tool and .created_at <= $received)
+              | select($agent == "claude-code" or ($turn != "" and .turn_id == $turn))
+              | select(if (.tool_use_id // "") != "" then .tool_use_id == $call and $call != ""
+                       else $unique and .tool_input_sha256 == $hash end)
+              | input_filename' "$requests/$scope."*.json 2>/dev/null)
+            # PermissionRequest 通常没有调用 ID。相同输入有多个待批请求时，保留它们，不猜是哪条。
+            if [ -n "$matches" ] && [ "$(printf '%s\n' "$matches" | /usr/bin/wc -l)" -eq 1 ]; then
+              /bin/rm -f "$matches" 2>/dev/null
+            fi
+          fi
+          ;;
+        Stop | StopFailure | UserPromptSubmit | SessionEnd | Interrupt)
+          # Codex 的异步 UserPromptSubmit 没有可靠的轮次先后信息，不撤回任何请求。
+          # 同轮 Stop / Interrupt、会话结束或审批超时负责回收，旧轮事件不会影响新轮。Devin 同样按轮次回收。
+          "$JQ" -r --arg agent "$agent" --arg session "$session" --arg turn "$turn" \
+            --arg kind "$kind" --argjson received "$received_at" '
+            select(.agent == $agent and .session_id == $session)
+            | select($agent == "claude-code" or (.created_at <= $received and
+                ($kind == "SessionEnd" or ($kind != "UserPromptSubmit" and
+                  $turn != "" and .turn_id == $turn))))
+            | input_filename' "$requests/$scope."*.json 2>/dev/null |
+            while IFS= read -r file; do /bin/rm -f "$file" 2>/dev/null; done
+          if [ "$kind" = SessionEnd ]; then
+            for correlation in "$requests/$scope."*.seen; do
+              suffix=${correlation#"$requests/$scope."}
+              # 只删除这个 session 的 64 字符指纹标记，避免 session 前缀相同的其他会话。
+              [ -d "$correlation" ] && [ "${#suffix}" -eq 69 ] && /bin/rm -rf "$correlation" 2>/dev/null
+            done
+          fi
+          ;;
+      esac
+    fi
+  fi
+fi
 exit 0

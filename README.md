@@ -45,16 +45,26 @@ pitwall-collector uninstall   # or, with the DMG: sh /Applications/Pitwall.app/C
 | Agent | Tested with | Notified when it waits for you | Jump back to the session |
 | --- | --- | --- | --- |
 | Claude Code | CLI and the Claude desktop app | Yes | Desktop session, or the terminal tab |
-| Codex | Desktop app, built-in CLI, Chrome extension | No reliable signal yet | Desktop session, or the terminal tab |
-| Cursor | IDE and background agents | No reliable signal | Opens Cursor |
-| Pi | Terminal | Yes, when an extension asks for input | Terminal tab |
-| Devin | Devin for Terminal | No reliable signal yet | Terminal tab |
+| Codex | Desktop app, built-in CLI, Chrome extension | Approval notifications for user-reviewed requests; passive status remains Unknown | Desktop session, or the terminal tab |
+| Cursor | IDE and background agents | No reliable signal; approving from Pitwall isn't supported | Opens Cursor |
+| Pi | Terminal | Yes, when an extension asks for input; allow / reject prompts can be answered from Pitwall | Terminal tab |
+| Devin | Devin for Terminal | Approval notifications for interactive sessions; passive status remains Unknown | Terminal tab |
 
 Jumping to the exact tab works in Terminal, iTerm2 and Otty. Pitwall doesn't guess: when a signal isn't reliable, it doesn't claim the agent is waiting.
 
 ## How the collector works
 
 Each agent calls `collector/bin/pitwall-hook` through its official hooks (Pi uses `collector/pi/pitwall.ts` through its extension API). The hook keeps status fields and short excerpts and appends one JSON line to `~/.pitwall/events/<agent>.jsonl`. It never writes to stdout and always exits 0, so it can't approve or deny anything, block a prompt or add to the agent's context. It makes no network requests.
+
+For Claude Code, the installer also registers `collector/bin/pitwall-approval` on `PermissionRequest`, so you can approve or deny a request from the Pitwall app. Claude Code shows its own dialog at the same time and the first answer applies. The hook answers only when you click Approve or Deny in Pitwall; if Pitwall isn't running it exits at once without output. While it waits, the request sits in `~/.pitwall/approvals/` on your Mac and is deleted once answered or withdrawn; tool input JSON longer than 4,000 characters is truncated for display. Terminal answers withdraw only a matching call: by call ID when available, otherwise by a unique fingerprint of the complete input. Repeated identical inputs without call IDs stay until the hook exits, the turn or session ends, or the hook times out; they are never withdrawn by tool name alone. Local fingerprint markers stay until the session ends so a late event cannot withdraw a repeated request. The request format is internal and may change between versions.
+
+Codex also registers `pitwall-approval codex` on `PermissionRequest`. Trust the new hook in Codex `/hooks` or hook settings after reinstalling the collector. Only requests whose current rollout turn explicitly has `approvals_reviewer = "user"` are handled; auto-review and missing or unknown metadata go straight back to Codex. Codex waits for the hook before showing its own dialog: approve or deny in Pitwall, or approve on the notification banner, within 60 seconds. If unanswered, or Pitwall stops listening, the hook exits without a decision and Codex continues its normal approval flow. Requests are isolated by agent, session and turn; interrupted or finished turns withdraw only their own requests. The hook reads at most the last 1 MiB of the rollout to identify the reviewer and retains no rollout content. Approval request files temporarily contain display input as described above; the event spool still omits Codex tool inputs.
+
+Devin also registers `pitwall-approval devin` on `PermissionRequest`. Like Codex, Devin shows its own dialog only after the hook returns: approve or deny in Pitwall, or approve on the notification banner, within 60 seconds; otherwise the hook exits without a decision and Devin's dialog appears. Print mode (`devin -p`) has nobody to answer, so it goes straight back to Devin. Devin's payload has no working directory, so the request records `DEVIN_PROJECT_DIR`. `Stop` withdraws only its own prompt's requests and `SessionEnd` clears the session's.
+
+Pi has no approval hook; its prompts come from other extensions, such as command guards. While Pitwall listens, `collector/pi/pitwall.ts` hands allow / reject prompts raised during an agent run to Pitwall in the same request format: a select prompt with exactly one allow-like and one reject-like option, or a confirm prompt. The terminal prompt stays open and the first answer applies; an answer in Pitwall closes the terminal prompt and passes the matching option back to the extension that asked. Other prompts are left alone. Approval cards show the dialog's own title and message without guessing which tool call it belongs to. The extension does not read or retain tool inputs; the event spool still records only the first 120 characters of the title.
+
+Cursor isn't supported: it has no hook that fires only when it asks you, and its `before*` hooks run for every proposed command.
 
 **Recorded:** event name, time, session and turn IDs, working directory, transcript path, tool name, status and stop reason, a truncated error, the first line of the prompt (up to 80 characters), and terminal hints (tty, `TERM_PROGRAM`) used to jump back to the session. For Claude Code and Pi only: the first line of a pending approval (up to 120 characters) and the first 160 characters of the final reply, so the board can show what the agent is waiting on and how it finished.
 

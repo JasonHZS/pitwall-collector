@@ -16,6 +16,7 @@ JQ=/usr/bin/jq
 PW_HOME=${PITWALL_HOME:-$HOME/.pitwall}
 BIN_DIR="$PW_HOME/bin"
 HOOK="$BIN_DIR/pitwall-hook"
+APPROVAL="$BIN_DIR/pitwall-approval"
 BACKUP_DIR="$PW_HOME/backups/$(date +%Y%m%d-%H%M%S)"
 BACKUP_KEEP=10
 
@@ -27,16 +28,16 @@ DEVIN_CFG="$HOME/.config/devin/config.json"
 
 CLAUDE_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PostToolUseFailure","PermissionRequest","PermissionDenied","Notification","Elicitation","Stop","StopFailure"]'
 CLAUDE_TOOL_EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","PermissionRequest","PermissionDenied"]'
-CODEX_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PermissionRequest","PostToolUse","Stop"]'
+CODEX_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PermissionRequest","PostToolUse","Stop","Interrupt"]'
 # Cursor 的 before* 权限类 hook（beforeShellExecution 等）带决策语义，刻意不注册。
 CURSOR_EVENTS='["sessionStart","sessionEnd","beforeSubmitPrompt","postToolUse","postToolUseFailure","stop"]'
 # Devin 只认这 8 个事件：hooks 里出现任何别的事件名（或 async 等未知字段的风险），
 # Devin 会整段忽略 hooks 设置——连同用户自己的 hook。所以这里只登记这 8 个、不写 async / matcher。
 DEVIN_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PermissionRequest","Stop","PostCompaction"]'
 
-# pitwall 的 handler 以命令里含 pitwall-hook 识别；Claude/Codex 是两层结构，Cursor 是一层。
+# pitwall 的 handler 以命令里含 pitwall-hook / pitwall-approval 识别；Claude/Codex 是两层结构，Cursor 是一层。
 JQ_DEFS='
-def ours: (.command // "") | tostring | contains("pitwall-hook");
+def ours: (.command // "") | tostring | (contains("pitwall-hook") or contains("pitwall-approval"));
 def strip_nested:
   if (.hooks | type) == "object" then
     .hooks |= (with_entries(.value |= (map(.hooks |= map(select(ours | not))) | map(select((.hooks | length) > 0))))
@@ -49,9 +50,10 @@ def strip_flat:
 # ensure_*：该事件里 pitwall 的条目已与期望一致就原样保留（包括位置），否则删掉旧条目再追加。
 # 这样别的工具在我们之后追加的 hook 不会让重复安装调换顺序。prune_*：清掉不再登记的事件里的旧条目。
 def without_ours_nested: map(.hooks |= map(select(ours | not))) | map(select((.hooks | length) > 0));
-def ensure_nested($e; $entry):
-  if (.hooks | type) == "object" and [.hooks[$e][]? | select(any(.hooks[]?; ours))] == [$entry] then .
-  else .hooks[$e] = (((.hooks[$e] // []) | without_ours_nested) + [$entry]) end;
+def ensure_nested_all($e; $entries):
+  if (.hooks | type) == "object" and [.hooks[$e][]? | select(any(.hooks[]?; ours))] == $entries then .
+  else .hooks[$e] = (((.hooks[$e] // []) | without_ours_nested) + $entries) end;
+def ensure_nested($e; $entry): ensure_nested_all($e; [$entry]);
 def prune_nested($events):
   if (.hooks | type) == "object" then
     .hooks |= with_entries(.key as $k | if ($events | index($k)) == null then .value |= without_ours_nested else . end
@@ -72,7 +74,7 @@ log() { printf '%s\n' "$*"; }
 say() { printf '%s\n%s\n' "$1" "$2"; }
 
 count_ours() {
-  "$JQ" '[.. | objects | select(has("command")) | select(.command | tostring | contains("pitwall-hook"))] | length' "$1" 2>/dev/null || echo 0
+  "$JQ" '[.. | objects | select(has("command")) | select(.command | tostring | (contains("pitwall-hook") or contains("pitwall-approval")))] | length' "$1" 2>/dev/null || echo 0
 }
 
 # edit_json <文件> <jq 程序> [jq 参数...]
@@ -97,8 +99,13 @@ edit_json() {
     return 0
   fi
   if [ -e "$file" ]; then
-    mkdir -p "$BACKUP_DIR"
-    cp -p "$file" "$BACKUP_DIR/$(printf '%s' "${file#"$HOME"/}" | sed 's/^\.//' | tr '/' '_')"
+    # 备份失败就不改：调用方在 || / && 里，set -e 不会替我们中止。
+    if ! { mkdir -p "$BACKUP_DIR" &&
+           cp -p "$file" "$BACKUP_DIR/$(printf '%s' "${file#"$HOME"/}" | sed 's/^\.//' | tr '/' '_')"; }; then
+      rm -f "$tmp"
+      say "  ✗ could not back up $file; left unchanged" "  ✗ 备份 $file 失败，未修改"
+      return 1
+    fi
   else
     mkdir -p "$(dirname "$file")"
   fi
@@ -110,17 +117,22 @@ edit_json() {
   fi
 }
 
+# PermissionRequest 另登记一个同步的 pitwall-approval：Claude Code 照常显示终端审批框，同时把请求交给
+# Pitwall；Pitwall 没在运行时它立即退出、不输出。timeout 略长于脚本自己的 900 秒上限。
 install_claude() {
   [ -d "$HOME/.claude" ] || { say "claude-code: ~/.claude not found, skipped" "claude-code：未找到 ~/.claude，跳过"; return 0; }
   edit_json "$CLAUDE_CFG" '
     prune_nested($events)
     | reduce $events[] as $e (.;
-        ensure_nested($e;
-          (if ($tool | index($e)) != null then {matcher: "*"} else {} end)
-          + {hooks: [{type: "command", command: ($hook + " claude-code " + $e), async: true, timeout: 10}]}))' \
-    --argjson events "$CLAUDE_EVENTS" --argjson tool "$CLAUDE_TOOL_EVENTS" --arg hook "$HOOK" && {
+        ensure_nested_all($e;
+          [(if ($tool | index($e)) != null then {matcher: "*"} else {} end)
+           + {hooks: [{type: "command", command: ($hook + " claude-code " + $e), async: true, timeout: 10}]}]
+          + (if $e == "PermissionRequest"
+             then [{matcher: "*", hooks: [{type: "command", command: ($approval + " claude-code"), timeout: 960}]}]
+             else [] end)))' \
+    --argjson events "$CLAUDE_EVENTS" --argjson tool "$CLAUDE_TOOL_EVENTS" --arg hook "$HOOK" --arg approval "$APPROVAL" && {
     n=$(count_ours "$CLAUDE_CFG")
-    say "claude-code: $n pitwall hooks in $CLAUDE_CFG (async, never block)" "claude-code：$CLAUDE_CFG 中 pitwall hook $n 个（异步执行，不阻塞）"
+    say "claude-code: $n pitwall hooks in $CLAUDE_CFG (the approval hook answers only when you click in Pitwall)" "claude-code：$CLAUDE_CFG 中 pitwall hook $n 个（审批 hook 只在你于 Pitwall 中点击时作答）"
   }
 }
 
@@ -130,11 +142,15 @@ install_codex() {
   edit_json "$CODEX_CFG" '
     prune_nested($events)
     | reduce $events[] as $e (.;
-        ensure_nested($e;
-          {matcher: "", hooks: [{type: "command", command: ($hook + " codex " + $e)} + (if $e == "SessionEnd" then {} else {async: true} end)]}))' \
-    --argjson events "$CODEX_EVENTS" --arg hook "$HOOK" && {
+        ensure_nested_all($e;
+          [{matcher: "", hooks: [{type: "command", command: ($hook + " codex " + $e)}
+            + (if $e == "SessionEnd" or $e == "Interrupt" then {timeout: 3} else {async: true} end)]}]
+          + (if $e == "PermissionRequest"
+             then [{matcher: "", hooks: [{type: "command", command: ($approval + " codex"), timeout: 65}]}]
+             else [] end)))' \
+    --argjson events "$CODEX_EVENTS" --arg hook "$HOOK" --arg approval "$APPROVAL" && {
     n=$(count_ours "$CODEX_CFG")
-    say "codex: $n pitwall hooks in $CODEX_CFG (they run once you trust them in Codex)" "codex：$CODEX_CFG 中 pitwall hook $n 个（需在 Codex 里信任后才会运行）"
+    say "codex: $n pitwall hooks in $CODEX_CFG (trust the new approval hook in Codex; user-reviewed requests wait up to 60 seconds in Pitwall)" "codex：$CODEX_CFG 中 pitwall hook $n 个（需在 Codex 里信任新审批 hook；用户审批请求在 Pitwall 中最多等待 60 秒）"
   }
 }
 
@@ -152,26 +168,29 @@ install_cursor() {
 
 install_pi() {
   [ -d "$HOME/.pi/agent" ] || { say "pi: ~/.pi/agent not found, skipped" "pi：未找到 ~/.pi/agent，跳过"; return 0; }
-  mkdir -p "$(dirname "$PI_EXT")"
   # 这个文件是 pitwall 自己的扩展，不是用户配置：直接覆盖，不备份。
-  install -m 644 "$here/pi/pitwall.ts" "$PI_EXT"
-  say "pi: extension installed at $PI_EXT (new Pi sessions pick it up; run /reload in open ones)" "pi：扩展已放到 ${PI_EXT}（新开的 Pi 会话生效，已开的会话可 /reload）"
+  mkdir -p "$(dirname "$PI_EXT")" && install -m 644 "$here/pi/pitwall.ts" "$PI_EXT" || return 1
+  say "pi: extension installed at $PI_EXT (new Pi sessions pick it up; run /reload in open ones; it can answer other extensions' allow / reject prompts from Pitwall)" "pi：扩展已放到 ${PI_EXT}（新开的 Pi 会话生效，已开的会话可 /reload；可在 Pitwall 中回答其它扩展的允许 / 拒绝提示）"
 }
 
 # Devin 的 hook 是同步执行的（没有 async）；pitwall-hook 只做一次 jq 追加，并设 10 秒上限。
+# PermissionRequest 另登记 pitwall-approval：Devin 等它返回才显示自己的审批框，脚本最多等 60 秒。
 install_devin() {
   [ -d "$HOME/.config/devin" ] || { say "devin: ~/.config/devin not found, skipped" "devin：未找到 ~/.config/devin，跳过"; return 0; }
   edit_json "$DEVIN_CFG" '
     prune_nested($events)
     | reduce $events[] as $e (.;
-        ensure_nested($e; {hooks: [{type: "command", command: ($hook + " devin " + $e), timeout: 10}]}))' \
-    --argjson events "$DEVIN_EVENTS" --arg hook "$HOOK" && {
-    n=$(count_ours "$DEVIN_CFG")
-    say "devin: $n pitwall hooks in $DEVIN_CFG (new Devin sessions pick them up)" "devin：$DEVIN_CFG 中 pitwall hook $n 个（新开的 Devin 会话生效）"
-  }
+        ensure_nested_all($e;
+          [{hooks: [{type: "command", command: ($hook + " devin " + $e), timeout: 10}]}]
+          + (if $e == "PermissionRequest"
+             then [{hooks: [{type: "command", command: ($approval + " devin"), timeout: 65}]}]
+             else [] end)))' \
+    --argjson events "$DEVIN_EVENTS" --arg hook "$HOOK" --arg approval "$APPROVAL" || return 1
+  n=$(count_ours "$DEVIN_CFG")
+  say "devin: $n pitwall hooks in $DEVIN_CFG (new Devin sessions pick them up; requests wait up to 60 seconds in Pitwall)" "devin：$DEVIN_CFG 中 pitwall hook $n 个（新开的 Devin 会话生效；审批请求在 Pitwall 中最多等待 60 秒）"
   # 用户自己登记在其它事件名下的 hook 不归我们删，但它会让 Devin 忽略全部 hooks（包括我们的）。
   extra=$("$JQ" -r --argjson events "$DEVIN_EVENTS" '(.hooks // {}) | keys - $events | join(", ")' "$DEVIN_CFG" 2>/dev/null) || extra=''
-  [ -z "$extra" ] || say "  ✗ devin: hooks contain events Devin does not know ($extra), so Devin ignores all hooks; remove those events by hand" "  ✗ devin：hooks 含 Devin 不认识的事件（$extra），Devin 会忽略全部 hooks；请手动移除这些事件"
+  [ -z "$extra" ] || say "  ✗ devin: hooks contain events Devin does not know ($extra), so Devin ignores all hooks; remove those events by hand" "  ✗ devin：hooks 含 Devin 不认识的事件（${extra}），Devin 会忽略全部 hooks；请手动移除这些事件"
 }
 
 uninstall_claude() {
@@ -231,6 +250,28 @@ Before any agent config is changed, the original is backed up to ~/.pitwall/back
 EOF
 }
 
+# 某个 agent 失败只跳过它自己：记下名字，其余照常进行，最后统一报告并以非零退出。
+# 注意：在 || 左侧调用的函数里 set -e 不生效，所以每个 install_* / uninstall_* 都要自己返回失败状态。
+failed=''
+run_agent() { # <动作前缀> <agent>
+  case $2 in
+    claude-code) "$1"_claude ;;
+    codex) "$1"_codex ;;
+    cursor) "$1"_cursor ;;
+    pi) "$1"_pi ;;
+    devin) "$1"_devin ;;
+    *) say "unknown agent: $2" "未知 agent：$2" ;;
+  esac || failed="$failed $2"
+}
+
+report_failed() {
+  [ -n "$failed" ] || return 0
+  list=$(printf '%s' "${failed# }" | sed 's/ /, /g')
+  log ""
+  say "✗ $1 did not finish for: $list (see the ✗ lines above); the other agents were handled" "✗ 以下 agent 未完成$2：${list}（原因见上方 ✗ 行）；其余 agent 已处理"
+  exit 1
+}
+
 cmd=${1:-}
 [ $# -gt 0 ] && shift
 agents=${*:-claude-code codex cursor pi devin}
@@ -242,16 +283,8 @@ case "$cmd" in
     mkdir -p "$BIN_DIR" "$PW_HOME/events"
     install -m 755 "$here/bin/pitwall-hook" "$HOOK"
     install -m 755 "$here/bin/pitwall-events" "$BIN_DIR/pitwall-events"
-    for a in $agents; do
-      case $a in
-        claude-code) install_claude ;;
-        codex) install_codex ;;
-        cursor) install_cursor ;;
-        pi) install_pi ;;
-        devin) install_devin ;;
-        *) say "unknown agent: $a" "未知 agent：$a" ;;
-      esac
-    done
+    install -m 755 "$here/bin/pitwall-approval" "$APPROVAL"
+    for a in $agents; do run_agent install "$a"; done
     prune_backups
     [ -d "$BACKUP_DIR" ] && say "original configs backed up to $BACKUP_DIR" "原配置已备份到 $BACKUP_DIR"
     log ""
@@ -259,21 +292,14 @@ case "$cmd" in
     case " $agents " in
       *" codex "*) say "Codex holds new hooks for review: open /hooks in Codex and trust the pitwall hooks (this script does not do it for you)." "Codex 会拦下新 hook 等你审核：在 Codex 里打开 /hooks 信任 pitwall 的 hook（本脚本不会代签）。" ;;
     esac
+    report_failed install 安装
     ;;
   uninstall)
-    for a in $agents; do
-      case $a in
-        claude-code) uninstall_claude ;;
-        codex) uninstall_codex ;;
-        cursor) uninstall_cursor ;;
-        pi) uninstall_pi ;;
-        devin) uninstall_devin ;;
-        *) say "unknown agent: $a" "未知 agent：$a" ;;
-      esac
-    done
+    for a in $agents; do run_agent uninstall "$a"; done
     prune_backups
     [ -d "$BACKUP_DIR" ] && say "configs before the change backed up to $BACKUP_DIR" "改动前的配置已备份到 $BACKUP_DIR"
     say "collected events stay in $PW_HOME/events/; delete them yourself if you want." "已采集的事件保留在 $PW_HOME/events/，需要时手动删除。"
+    report_failed uninstall 卸载
     ;;
   *)
     usage

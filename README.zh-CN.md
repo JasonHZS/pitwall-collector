@@ -45,16 +45,26 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Agent | 已验证形态 | 等待处理时提醒 | 返回原会话 |
 | --- | --- | --- | --- |
 | Claude Code | CLI 与 Claude 桌面版 | 支持 | 桌面会话，或终端标签页 |
-| Codex | 桌面版、内置 CLI、Chrome 插件 | 暂无可靠信号 | 桌面会话，或终端标签页 |
-| Cursor | IDE 与后台 Agent | 没有可靠信号 | 打开 Cursor |
-| Pi | 终端版 | 支持：扩展请求输入时 | 终端标签页 |
-| Devin | Devin for Terminal | 暂无可靠信号 | 终端标签页 |
+| Codex | 桌面版、内置 CLI、Chrome 插件 | 用户审批请求支持批准通知；被动状态仍为未知 | 桌面会话，或终端标签页 |
+| Cursor | IDE 与后台 Agent | 没有可靠信号；不支持在 Pitwall 中审批 | 打开 Cursor |
+| Pi | 终端版 | 支持：扩展请求输入时；允许 / 拒绝类提示可在 Pitwall 中回答 | 终端标签页 |
+| Devin | Devin for Terminal | 交互会话的审批请求支持批准通知；被动状态仍为未知 | 终端标签页 |
 
 精准返回标签页支持终端、iTerm2 和 Otty。没有可靠信号时，Pitwall 不会猜测 Agent 正在等你。
 
 ## 采集器如何工作
 
 各 Agent 通过官方 hook 调用 `collector/bin/pitwall-hook`（Pi 通过扩展 API 加载 `collector/pi/pitwall.ts`）。hook 只保留状态字段与简短摘录，向 `~/.pitwall/events/<agent>.jsonl` 追加一行 JSON。它永远不写 stdout、永远以 0 退出，因此不会批准或拒绝任何操作、不会阻塞请求，也不会向 Agent 注入内容。它不发起任何网络请求。
+
+Claude Code 另登记了 `collector/bin/pitwall-approval`（`PermissionRequest`），让你可以在 Pitwall App 里批准或拒绝请求。Claude Code 同时照常显示自己的审批框，先回答的一方生效。这个 hook 只在你于 Pitwall 中点击“批准”或“拒绝”时作答；Pitwall 没在运行时它立即无输出退出。等待期间，请求只保存在本机的 `~/.pitwall/approvals/`，回答或撤回后删除；用于显示的工具输入 JSON 超过 4000 字符时截断。终端先回答时，有调用 ID 就按 ID 撤回，否则按完整输入的唯一指纹匹配。同一会话曾多次请求相同输入且没有调用 ID 时，保留请求到 hook 退出、轮次 / 会话结束或超时，不按工具名猜测撤回。本机关联标记保留到会话结束，避免迟到事件撤回重复的新请求。请求格式为内部接口，可能随版本变化。
+
+Codex 也在 `PermissionRequest` 登记 `pitwall-approval codex`。重装采集器后，在 Codex `/hooks` 或钩子设置中信任新 hook。只接管当前 rollout 轮次明确 `approvals_reviewer = "user"` 的请求；自动审查、缺失或未知 metadata 立即交回 Codex。Codex 会先等待 hook，再显示原审批框：60 秒内可在 Pitwall 批准 / 拒绝，或从通知横幅批准。未回答、Pitwall 退出或停止监听时无输出回落到原审批流程。请求按 Agent、会话与轮次隔离，中断与结束仅撤回对应轮。hook 最多读取 rollout 末尾 1 MiB 判断 reviewer，不保存正文；待批文件临时保存用于显示的输入，事件 spool 仍不记录 Codex 工具参数。
+
+Devin 也在 `PermissionRequest` 登记 `pitwall-approval devin`。与 Codex 一样，Devin 等 hook 返回后才显示原审批框：60 秒内可在 Pitwall 批准 / 拒绝，或从通知横幅批准；未回答时无输出退出，Devin 随即显示原审批框。打印模式（`devin -p`）没有人能回答，立即交回 Devin。Devin 的 payload 不带工作目录，请求记录 `DEVIN_PROJECT_DIR`。`Stop` 只撤回本轮请求，`SessionEnd` 清理整个会话。
+
+Pi 没有审批 hook，审批框来自命令守卫等其它扩展。Pitwall 监听时，`collector/pi/pitwall.ts` 把 Agent 运行中弹出的允许 / 拒绝提示按同一请求格式交给 Pitwall：选项里恰好有一个“允许”和一个“拒绝”的选择框，或确认框。终端选择框照常显示，先回答的一方生效；在 Pitwall 回答会关闭终端选择框，并把对应选项交还给弹框的扩展。其它提示原样不动。审批卡片显示选择框的标题或确认框的标题与正文，不推断工具归属。扩展不读取或保留工具参数；事件 spool 仍只记录标题的前 120 字。
+
+Cursor 不支持：它没有只在需要你确认时触发的 hook，`before*` hook 对每条拟执行命令都会触发。
 
 **记录：** 事件名、时间、会话与轮次 ID、工作目录、transcript 路径、工具名、状态与结束原因、截断的错误信息、请求首行（最多 80 字），以及用于返回原会话的终端线索（tty、`TERM_PROGRAM`）。仅 Claude Code 和 Pi 额外记录：待审批内容的首行（最多 120 字）和最后一条回复的前 160 字，用于在看板上显示“在等什么”和“结果如何”。
 

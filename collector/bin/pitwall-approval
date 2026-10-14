@@ -1,0 +1,111 @@
+#!/bin/sh
+# pitwall-approval：把 Claude Code / Codex / Devin 的审批请求交给 Pitwall，等用户批准或拒绝。
+#
+#   pitwall-approval claude-code    # PermissionRequest 的 payload 从 stdin 传入
+#   pitwall-approval codex          # Codex 在 hook 返回后才显示原生审批框
+#   pitwall-approval devin          # Devin 同样在 hook 返回后才显示原生审批框
+#
+# Pi 没有 hook 审批：它的审批框来自其它扩展，由 Pitwall 的 Pi 扩展（pi/pitwall.ts）按同一文件格式接管。
+#
+# Claude Code 运行这个 hook 的同时照常显示终端里的审批框，两边谁先回答算谁的：
+# - Pitwall 没在运行（~/.pitwall/approvals/listening 超过 6 秒没更新）：立即退出、不输出，什么都不改变。
+# - 你在 Pitwall 里回答：输出 allow / deny，终端审批框随之关闭。
+# - 你在终端里回答：pitwall-hook 收到后续事件时删掉这次请求，本脚本随即退出、不输出。
+# 请求文件只在本机，处理完即删除。内部接口，格式可能随版本变化。
+# 桌面 App 启动的 agent 的 PATH 很短，这里只用绝对路径的系统命令。
+
+agent=${1:-}
+dir="${PITWALL_HOME:-$HOME/.pitwall}/approvals"
+JQ=/usr/bin/jq
+LIMIT=900          # 最长等待秒数；登记的 hook timeout 略长于它
+
+payload=$(/bin/cat)
+[ -x "$JQ" ] || exit 0
+case "$agent" in claude-code | codex | devin) ;; *) exit 0 ;; esac
+
+listening() {
+  beat=$(/usr/bin/stat -f %m "$dir/listening" 2>/dev/null) || return 1
+  [ $(($(/bin/date +%s) - beat)) -le 6 ]
+}
+listening || exit 0
+
+# Codex 的自动审查也触发 PermissionRequest。只接管明确交给用户的当前轮，
+# 缺少 metadata / 元数据太远 / 格式未知时立即交回 Codex，不延迟自动审查。
+# 只读日志末尾至多 1 MiB；不把 rollout 正文或 reviewer 写到 spool。
+if [ "$agent" = codex ]; then
+  LIMIT=60
+  turn=$(printf '%s' "$payload" | "$JQ" -r '.turn_id | select(type == "string" and length > 0)' 2>/dev/null)
+  transcript=$(printf '%s' "$payload" | "$JQ" -r '.transcript_path | select(type == "string")' 2>/dev/null)
+  [ -n "$turn" ] && [ -f "$transcript" ] && [ -r "$transcript" ] || exit 0
+  reviewer=$(/usr/bin/tail -c 1048576 "$transcript" 2>/dev/null | "$JQ" -Rr --arg turn "$turn" '
+    fromjson? | select(.type == "turn_context" and .payload.turn_id == $turn)
+    | .payload.approvals_reviewer // "unknown"' 2>/dev/null | /usr/bin/tail -n 1)
+  [ "$reviewer" = user ] || exit 0
+fi
+
+# Devin 同步执行 hook，返回后才显示自己的审批框，所以与 Codex 一样最多等 60 秒。
+# 打印模式（-p / --print，包括 -pPROMPT / --print=PROMPT）不接管，免得脚本白等。
+# hook 的父进程就是 devin；只看 `--` 之前的参数，不把 prompt 里的 -p 当成选项。
+if [ "$agent" = devin ]; then
+  LIMIT=60
+  args=$(/bin/ps -o args= -p "$PPID" 2>/dev/null) || exit 0
+  case " ${args%% -- *} " in *" -p"* | *" --print "* | *" --print="*) exit 0 ;; esac
+fi
+
+# 文件名带上会话与工具；撤回时再核对调用 ID 或完整输入的指纹，不能只按工具名删除。
+fields=$(printf '%s' "$payload" | "$JQ" -r '
+  def safe: if type == "string" and test("^[A-Za-z0-9_.-]{1,128}$") then . else empty end;
+  [(.session_id | safe), (.tool_name // "" | gsub("[^A-Za-z0-9_]"; "_") | .[0:64])] | select(length == 2) | join(" ")' 2>/dev/null)
+[ -n "$fields" ] || exit 0
+session=${fields% *}
+tool=${fields#* }
+scope=$session
+[ "$agent" = claude-code ] || scope="$agent.$session"
+id="$(/bin/date +%s)-$$"
+request="$dir/requests/$scope.$tool.$id.json"
+decision="$dir/decisions/$id"
+
+canonical=$(printf '%s' "$payload" | "$JQ" -cS '
+  select((.tool_name | type) == "string" and (.tool_input | type) == "object")
+  | [.tool_name, .tool_input]' 2>/dev/null)
+[ -n "$canonical" ] || exit 0
+input_hash=$(printf '%s' "$canonical" | /usr/bin/shasum -a 256 | /usr/bin/cut -d ' ' -f 1)
+
+/bin/mkdir -p "$dir/requests" "$dir/decisions" 2>/dev/null && /bin/chmod 700 "$dir" 2>/dev/null || exit 0
+# 相同输入在一个会话中再次请求时，迟到的旧完成事件无法与新调用区分。
+# 原子创建标记；重复标记一直保留到 SessionEnd，不能随着单条请求的清理而重置。
+correlation="$dir/requests/$scope.$input_hash.seen"
+if ! /bin/mkdir "$correlation" 2>/dev/null; then
+  /usr/bin/touch "$correlation/repeated" 2>/dev/null || exit 0
+fi
+# Devin 的 payload 不带 cwd 与 turn_id：用它设置的 DEVIN_PROJECT_DIR，轮次用每次提交轮换的 prompt_id。
+printf '%s' "$payload" | "$JQ" -c --arg id "$id" --arg agent "$agent" --argjson pid "$$" --arg hash "$input_hash" \
+  --arg project "${DEVIN_PROJECT_DIR:-}" '
+  def cap: if (tojson | length) > 4000 then {_truncated: (tojson | .[0:4000])} else . end;
+  {v: 1, id: $id, agent: $agent, created_at: now, pid: $pid, session_id,
+   turn_id: (if $agent == "devin" then .prompt_id else .turn_id end),
+   cwd: (.cwd // (if $agent == "devin" and $project != "" then $project else null end)),
+   permission_mode, tool_name, tool_input: (.tool_input | cap),
+   tool_use_id: (.tool_use_id | if type == "string" and length > 0 then . else null end),
+   tool_input_sha256: $hash}
+  | with_entries(select(.value != null))' > "$request.tmp" 2>/dev/null &&
+  /bin/mv "$request.tmp" "$request" || { /bin/rm -f "$request.tmp"; exit 0; }
+
+cleanup() { /bin/rm -f "$request" "$decision"; }
+trap 'cleanup; exit 0' HUP INT TERM
+
+start=$(/bin/date +%s)
+while :; do
+  if [ -f "$decision" ]; then
+    answer=$(/usr/bin/head -c 16 "$decision")
+    cleanup
+    case "$answer" in
+      allow) printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}' ;;
+      deny) printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied in Pitwall."}}}' ;;
+    esac
+    exit 0
+  fi
+  # 请求被撤回（终端里已回答）、Pitwall 退出，或等太久：不输出，交给终端的审批框。
+  [ -f "$request" ] && listening && [ $(($(/bin/date +%s) - start)) -lt "$LIMIT" ] || { cleanup; exit 0; }
+  /bin/sleep 0.2
+done
