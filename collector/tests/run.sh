@@ -49,7 +49,8 @@ check "codex：8 个事件 hook" test "$(count_ours "$X")" = 8
 jqcheck "codex：保留用户 hook" "$X" '[.hooks.Stop[].hooks[].command] | index("/usr/bin/true user-hook") != null'
 jqcheck "codex：SessionEnd 不设 async（Codex 不支持）" "$X" '.hooks.SessionEnd[0].hooks[0] | has("async") | not'
 jqcheck "codex：审批 hook 同步执行，timeout 长于脚本上限" "$X" '[.hooks.PermissionRequest[].hooks[] | select(.command | contains("pitwall-approval"))] == [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval codex", timeout: 65}]'
-jqcheck "codex：审批 hook 只登记在 PermissionRequest" "$X" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] == ["PermissionRequest"]'
+jqcheck "codex：审批 hook 只登记在 PermissionRequest 与提问的 PreToolUse" "$X" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] | sort == ["PermissionRequest", "PreToolUse"]'
+jqcheck "codex：提问 hook 只匹配 request_user_input，同步执行" "$X" '[.hooks.PreToolUse[] | select(any(.hooks[]; .command | contains("pitwall-approval")))] == [{matcher: "^request_user_input$", hooks: [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval codex", timeout: 65}]}]'
 jqcheck "codex：Interrupt 同步执行，3 秒上限" "$X" '.hooks.Interrupt[0].hooks[0] | .timeout == 3 and (has("async") | not)'
 check "cursor：6 个 pitwall hook" test "$(count_ours "$R")" = 6
 jqcheck "cursor：保留用户 hook 与 version" "$R" '.version == 1 and ([.hooks.stop[].command] | index("/usr/bin/true user-hook") != null)'
@@ -60,10 +61,11 @@ check "devin：8 个 pitwall hook" test "$(count_ours "$D")" = 8
 jqcheck "devin：保留模型、权限与用户 hook" "$D" '.agent.model == "swe-2" and .permissions.allow == ["Read(**)"] and ([.hooks.Stop[].hooks[].command] | index("/usr/bin/true user-devin-hook") != null)'
 # Devin 遇到未知事件名会整段忽略 hooks（包括用户自己的），所以只能登记它认识的 8 个。
 jqcheck "devin：只登记 Devin 认识的事件" "$D" '.hooks | keys - ["PreToolUse","PostToolUse","UserPromptSubmit","Stop","PostCompaction","SessionStart","SessionEnd","PermissionRequest"] == []'
-jqcheck "devin：不写 async / matcher" "$D" '[.hooks[][] | select(any(.hooks[]?; .command | test("pitwall-(hook|approval)"))) | (has("matcher") or any(.hooks[]; has("async")))] | any | not'
+jqcheck "devin：不写 async，只有提问 hook 写 matcher" "$D" '[.hooks[][] | select(any(.hooks[]?; .command | test("pitwall-(hook|approval)"))) | ((has("matcher") and .matcher != "^ask_user_question$") or any(.hooks[]; has("async")))] | any | not'
 jqcheck "devin：PermissionRequest 登记采集与审批两个 hook" "$D" '.hooks.PermissionRequest | length == 2'
 jqcheck "devin：审批 hook 同步执行，timeout 长于脚本 60 秒上限" "$D" '[.hooks.PermissionRequest[].hooks[] | select(.command | contains("pitwall-approval"))] == [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval devin", timeout: 65}]'
-jqcheck "devin：审批 hook 只登记在 PermissionRequest" "$D" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] == ["PermissionRequest"]'
+jqcheck "devin：审批 hook 只登记在 PermissionRequest 与提问的 PreToolUse" "$D" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] | sort == ["PermissionRequest", "PreToolUse"]'
+jqcheck "devin：提问 hook 只匹配 ask_user_question，同步执行" "$D" '[.hooks.PreToolUse[] | select(any(.hooks[]; .command | contains("pitwall-approval")))] == [{matcher: "^ask_user_question$", hooks: [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval devin", timeout: 65}]}]'
 
 sums() { shasum "$C" "$X" "$R" "$D" "$HOME/.pi/agent/extensions/pitwall.ts"; }
 before=$(sums)
@@ -238,9 +240,9 @@ check "devin Stop → done" test "$(state devin devin-sess-1)" = done
 check "status 表格可运行" "$EVENTS" status
 check "tail 可运行" "$EVENTS" tail -n 5
 "$EVENTS" hooks > "$tmp/hooks.txt" 2>&1 || fail "hooks 运行出错"
-check "hooks：列出三处配置的采集与审批 hook 数" sh -c "grep -q 'settings.json（13 个）' '$tmp/hooks.txt' && grep -q 'codex/hooks.json（9 个）' '$tmp/hooks.txt' && grep -q 'cursor/hooks.json（6 个）' '$tmp/hooks.txt'"
+check "hooks：列出三处配置的采集、审批与提问 hook 数" sh -c "grep -q 'settings.json（13 个）' '$tmp/hooks.txt' && grep -q 'codex/hooks.json（10 个）' '$tmp/hooks.txt' && grep -q 'cursor/hooks.json（6 个）' '$tmp/hooks.txt'"
 check "hooks：列出 pi 扩展订阅的事件" grep -q ui_prompt_start "$tmp/hooks.txt"
-check "hooks：列出 devin 配置的采集与审批 hook 数" grep -q 'devin/config.json（9 个）' "$tmp/hooks.txt"
+check "hooks：列出 devin 配置的采集、审批与提问 hook 数" grep -q 'devin/config.json（10 个）' "$tmp/hooks.txt"
 check "hooks：PermissionRequest 标为等待信号" grep -q '★ PermissionRequest' "$tmp/hooks.txt"
 check "hooks：提示其他来源的 hook" grep -q '另有 1 个其他来源的 hook' "$tmp/hooks.txt"
 check "summary：claude/codex/pi/devin 各报告 1 次等待/审批信号" test "$("$EVENTS" summary | grep -c '等待/审批信号：1 次')" = 4
@@ -429,6 +431,7 @@ check "Codex 缺少当前轮 metadata 时直接退出" test -z "$(printf '%s' "$
 sh "$root/tests/codex-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/devin-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/pi-approval.sh" || fails=$((fails + 1))
+sh "$root/tests/question-approval.sh" || fails=$((fails + 1))
 
 echo "损坏的配置不被覆盖"
 printf '{ not json' > "$R"

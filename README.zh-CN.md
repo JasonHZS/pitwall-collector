@@ -62,7 +62,14 @@ Codex 也在 `PermissionRequest` 登记 `pitwall-approval codex`。重装采集�
 
 Devin 也在 `PermissionRequest` 登记 `pitwall-approval devin`。与 Codex 一样，Devin 等 hook 返回后才显示原审批框：60 秒内可在 Pitwall 批准 / 拒绝，或从通知横幅批准；未回答时无输出退出，Devin 随即显示原审批框。打印模式（`devin -p`）没有人能回答，立即交回 Devin。Devin 的 payload 不带工作目录，请求记录 `DEVIN_PROJECT_DIR`。`Stop` 只撤回本轮请求，`SessionEnd` 清理整个会话。
 
-Pi 没有审批 hook，审批框来自命令守卫等其它扩展。Pitwall 监听时，`collector/pi/pitwall.ts` 把 Agent 运行中弹出的允许 / 拒绝提示按同一请求格式交给 Pitwall：选项里恰好有一个“允许”和一个“拒绝”的选择框，或确认框。终端选择框照常显示，先回答的一方生效；在 Pitwall 回答会关闭终端选择框，并把对应选项交还给弹框的扩展。其它提示原样不动。审批卡片显示选择框的标题或确认框的标题与正文，不推断工具归属。扩展不读取或保留工具参数；事件 spool 仍只记录标题的前 120 字。
+Pi 没有审批 hook，审批框来自命令守卫等其它扩展。Pitwall 监听时，`collector/pi/pitwall.ts` 把 Agent 运行中弹出的允许 / 拒绝提示按同一请求格式交给 Pitwall：选项里恰好有一个“允许”和一个“拒绝”的选择框，或确认框。终端选择框照常显示，先回答的一方生效；在 Pitwall 回答会关闭终端选择框，并把对应选项交还给弹框的扩展。审批卡片显示选择框的标题或确认框的标题与正文，不推断工具归属。除下文的提问工具外，扩展不读取或保留工具参数；事件 spool 仍只记录标题的前 120 字。
+
+**提问。** Agent 向你提问时，Pitwall 把题目和选项显示为表单，全部回答后发送。请求带 `answer_format: "answers-v1"`；不带这一标记的旧采集器只提示回到 Agent 回答。提问的输入完整保留、不截断；每道题都有非空回答才会回传。
+
+- Claude Code `AskUserQuestion`（`PermissionRequest`）：终端同时显示原生提问，先回答的一方生效；Pitwall 的回答作为 `updatedInput.answers` 返回。
+- Codex `request_user_input`、Devin `ask_user_question`：安装器在 `PreToolUse` 上为这两个工具单独登记 `pitwall-approval`。两者都等 hook 返回才显示原生提问，请在 60 秒内回答，否则照常显示原生提问。这两个工具的输入不接受回答，所以 hook 阻止这次调用，把你的回答写进模型读到的原因；终端会显示调用被拒绝，后面是你的回答。重新安装后需在 Codex 里信任新 hook。
+- Pi：Agent 运行中其它扩展弹出的普通选择框（只能选给定选项）与输入框，与审批一样和终端同时等待。Pi 示例中的 `question` / `questionnaire` 工具自绘界面，`tool_call` 先把题目交给 Pitwall 最多 60 秒，作答后以你的回答为原因阻止调用，否则照常显示工具自己的界面。
+- 不支持 Cursor 与 Kimi Code：Cursor 的提问工具尚未与 hook 联调验证，Kimi Code 的 hook 不等待回答。
 
 Cursor 不支持：它没有只在需要你确认时触发的 hook，`before*` hook 对每条拟执行命令都会触发。
 

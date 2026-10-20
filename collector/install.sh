@@ -32,7 +32,8 @@ CODEX_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","Perm
 # Cursor 的 before* 权限类 hook（beforeShellExecution 等）带决策语义，刻意不注册。
 CURSOR_EVENTS='["sessionStart","sessionEnd","beforeSubmitPrompt","postToolUse","postToolUseFailure","stop"]'
 # Devin 只认这 8 个事件：hooks 里出现任何别的事件名（或 async 等未知字段的风险），
-# Devin 会整段忽略 hooks 设置——连同用户自己的 hook。所以这里只登记这 8 个、不写 async / matcher。
+# Devin 会整段忽略 hooks 设置——连同用户自己的 hook。所以这里只登记这 8 个、不写 async；
+# matcher 是正则，只在提问 hook 上写精确的工具名（Claude 格式的 "*" 不是合法正则）。
 DEVIN_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PermissionRequest","Stop","PostCompaction"]'
 
 # pitwall 的 handler 以命令里含 pitwall-hook / pitwall-approval 识别；Claude/Codex 是两层结构，Cursor 是一层。
@@ -147,10 +148,12 @@ install_codex() {
             + (if $e == "SessionEnd" or $e == "Interrupt" then {timeout: 3} else {async: true} end)]}]
           + (if $e == "PermissionRequest"
              then [{matcher: "", hooks: [{type: "command", command: ($approval + " codex"), timeout: 65}]}]
+             elif $e == "PreToolUse"
+             then [{matcher: "^request_user_input$", hooks: [{type: "command", command: ($approval + " codex"), timeout: 65}]}]
              else [] end)))' \
     --argjson events "$CODEX_EVENTS" --arg hook "$HOOK" --arg approval "$APPROVAL" && {
     n=$(count_ours "$CODEX_CFG")
-    say "codex: $n pitwall hooks in $CODEX_CFG (trust the new approval hook in Codex; user-reviewed requests wait up to 60 seconds in Pitwall)" "codex：$CODEX_CFG 中 pitwall hook $n 个（需在 Codex 里信任新审批 hook；用户审批请求在 Pitwall 中最多等待 60 秒）"
+    say "codex: $n pitwall hooks in $CODEX_CFG (trust the new approval and question hooks in Codex; user-reviewed requests and questions wait up to 60 seconds in Pitwall)" "codex：$CODEX_CFG 中 pitwall hook $n 个（需在 Codex 里信任新的审批与提问 hook；用户审批请求与提问在 Pitwall 中最多等待 60 秒）"
   }
 }
 
@@ -175,6 +178,7 @@ install_pi() {
 
 # Devin 的 hook 是同步执行的（没有 async）；pitwall-hook 只做一次 jq 追加，并设 10 秒上限。
 # PermissionRequest 另登记 pitwall-approval：Devin 等它返回才显示自己的审批框，脚本最多等 60 秒。
+# PreToolUse 另为 ask_user_question 登记 pitwall-approval（matcher 是正则），提问同样最多等 60 秒。
 install_devin() {
   [ -d "$HOME/.config/devin" ] || { say "devin: ~/.config/devin not found, skipped" "devin：未找到 ~/.config/devin，跳过"; return 0; }
   edit_json "$DEVIN_CFG" '
@@ -184,10 +188,12 @@ install_devin() {
           [{hooks: [{type: "command", command: ($hook + " devin " + $e), timeout: 10}]}]
           + (if $e == "PermissionRequest"
              then [{hooks: [{type: "command", command: ($approval + " devin"), timeout: 65}]}]
+             elif $e == "PreToolUse"
+             then [{matcher: "^ask_user_question$", hooks: [{type: "command", command: ($approval + " devin"), timeout: 65}]}]
              else [] end)))' \
     --argjson events "$DEVIN_EVENTS" --arg hook "$HOOK" --arg approval "$APPROVAL" || return 1
   n=$(count_ours "$DEVIN_CFG")
-  say "devin: $n pitwall hooks in $DEVIN_CFG (new Devin sessions pick them up; requests wait up to 60 seconds in Pitwall)" "devin：$DEVIN_CFG 中 pitwall hook $n 个（新开的 Devin 会话生效；审批请求在 Pitwall 中最多等待 60 秒）"
+  say "devin: $n pitwall hooks in $DEVIN_CFG (new Devin sessions pick them up; requests and questions wait up to 60 seconds in Pitwall)" "devin：$DEVIN_CFG 中 pitwall hook $n 个（新开的 Devin 会话生效；审批请求与提问在 Pitwall 中最多等待 60 秒）"
   # 用户自己登记在其它事件名下的 hook 不归我们删，但它会让 Devin 忽略全部 hooks（包括我们的）。
   extra=$("$JQ" -r --argjson events "$DEVIN_EVENTS" '(.hooks // {}) | keys - $events | join(", ")' "$DEVIN_CFG" 2>/dev/null) || extra=''
   [ -z "$extra" ] || say "  ✗ devin: hooks contain events Devin does not know ($extra), so Devin ignores all hooks; remove those events by hand" "  ✗ devin：hooks 含 Devin 不认识的事件（${extra}），Devin 会忽略全部 hooks；请手动移除这些事件"

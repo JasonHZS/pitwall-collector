@@ -1,5 +1,5 @@
 #!/bin/sh
-# Pi 扩展的审批接管：用假的 ctx.ui 模拟终端选择框，不启动 Pi、不读写真实配置。
+# Pi 扩展的审批与提问接管：用假的 ctx.ui 模拟终端选择框与输入框，不启动 Pi、不读写真实配置。
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/pitwall-pi-approval.XXXXXX")
@@ -30,7 +30,7 @@ const dialog = (kind) => (...args) => new Promise((resolve) => {
   answerInTerminal = (value) => resolve(value);
   opts?.signal?.addEventListener("abort", () => { entry.closed = true; resolve(kind === "confirm" ? false : undefined); });
 });
-const ui = { select: dialog("select"), confirm: dialog("confirm"), notify() {} };
+const ui = { select: dialog("select"), confirm: dialog("confirm"), input: dialog("input"), notify() {} };
 const original = ui.select;
 // 扩展的轮询计时器 unref 了，不拖住 Pi 退出；真实 Pi 的终端界面让进程一直运行，这里用计时器代替。
 const alive = setInterval(() => {}, 1000);
@@ -104,12 +104,79 @@ p = ui.confirm("Proceed?", "");
 decide((await nextRequest()).id, "deny");
 check("确认框拒绝返回 false", (await p) === false);
 
+// 其它选择框是提问：只能在给定选项中选一个，Pitwall 的回答映射回原选项字符串。
 for (const options of [["Option A", "Option B"], ["Allow once", "Allow for session", "Reject"], ["Yes", "No", "Cancel"]]) {
   p = ui.select("Pick one", options);
+  req = await nextRequest();
+  check(`不是唯一允许 / 拒绝的选择框作为提问：${options.join(" / ")}`,
+    req.tool_name === "question" && req.answer_format === "answers-v1" &&
+    JSON.stringify(req.tool_input) === JSON.stringify({ questions: [{ question: "Pick one", header: "",
+      options: options.map((label) => ({ label })), allowOther: false }] }));
+  decide(req.id, JSON.stringify({ answers: { "Pick one": options[1] } }));
+  check(`提问回答返回所选选项：${options[1]}`, (await p) === options[1]);
+}
+for (const reply of ["allow", "{}", JSON.stringify({ answers: { "Pick one": "Not an option" } }), JSON.stringify({ answers: { "Pick one": " " } })]) {
+  p = ui.select("Pick one", ["Option A", "Option B"]);
+  req = await nextRequest();
+  decide(req.id, reply);
+  await sleep(400);
+  check(`无效回答（${reply}）交回终端`, pending().length === 0 && shown.at(-1).closed === false);
+  answerInTerminal("Option A");
+  check(`无效回答之后仍以终端为准（${reply}）`, (await p) === "Option A");
+}
+for (const options of [["Same", "Same"], ["A", ""]]) {
+  p = ui.select("Pick one", options);
   await sleep(250);
-  check(`不是唯一允许 / 拒绝的选择框不接管：${options.join(" / ")}`, pending().length === 0);
+  check(`选项重复或为空的选择框不接管：${JSON.stringify(options)}`, pending().length === 0);
   answerInTerminal(options[0]); await p;
 }
+p = ui.input("Branch name?", "feature/…");
+req = await nextRequest();
+check("输入框作为只能填写文字的提问",
+  req.tool_name === "question" && JSON.stringify(req.tool_input.questions) === JSON.stringify([{ question: "Branch name?", header: "", options: [], allowOther: true }]));
+decide(req.id, JSON.stringify({ answers: { "Branch name?": "fix/登录\n第二行" } }));
+check("输入框返回 Pitwall 填写的文字", (await p) === "fix/登录\n第二行");
+check("Pitwall 回答后关闭终端输入框", shown.at(-1).closed === true);
+p = ui.input("Branch name?");
+await nextRequest();
+answerInTerminal("main");
+check("输入框终端先回答时返回终端的文字", (await p) === "main");
+await sleep(50);
+check("输入框终端先回答时撤回请求", pending().length === 0);
+
+// 官方示例的提问工具：tool_call 先等 Pitwall，作答后阻止调用、回答写进原因。
+let call = handlers.tool_call({ toolCallId: "q1", toolName: "questionnaire", input: { questions: [
+  { id: "scope", label: "Scope", prompt: "Which scope?", options: [{ value: "a", label: "All", description: "Everything" }, { value: "m", label: "Mine" }] },
+  { id: "note", prompt: "Anything else?", options: [], allowOther: true }] } }, ctx);
+req = await nextRequest();
+check("questionnaire 换成 Pitwall 题目（标签作 header，空选项为填写题）",
+  req.tool_name === "question" && req.answer_format === "answers-v1" && JSON.stringify(req.tool_input.questions) === JSON.stringify([
+    { question: "Which scope?", header: "Scope", options: [{ label: "All", description: "Everything" }, { label: "Mine" }], allowOther: true },
+    { question: "Anything else?", header: "Q2", options: [], allowOther: true }]));
+const toolAnswers = { "Which scope?": "Mine", "Anything else?": "无" };
+decide(req.id, JSON.stringify({ answers: toolAnswers }));
+let result = await call;
+check("questionnaire 回答后阻止调用并把回答交给模型",
+  result?.block === true && JSON.parse(result.reason.split("\n").slice(1).join("\n"))["Which scope?"] === "Mine");
+await sleep(50);
+check("提问工具回答后清理请求", pending().length === 0);
+call = handlers.tool_call({ toolCallId: "q2", toolName: "question", input: { question: "Color?", options: [{ label: "Red" }] } }, ctx);
+req = await nextRequest();
+decide(req.id, JSON.stringify({ answers: { "Other?": "x" } }));
+check("question 工具的无效回答照常运行工具", (await call) === undefined);
+call = handlers.tool_call({ toolCallId: "q3", toolName: "question", input: { question: "Color?", options: [{ label: "Red" }] } }, ctx);
+await nextRequest();
+const stale = new Date(Date.now() - 60_000);
+utimesSync(join(appr, "listening"), stale, stale);
+check("停止监听时提问工具不再等待", (await call) === undefined && pending().length === 0);
+listen();
+const aborted = new AbortController();
+aborted.abort();
+check("中断后的提问工具立即照常运行、不留请求", (await handlers.tool_call({ toolCallId: "q5", toolName: "question",
+  input: { question: "Color?", options: [{ label: "Red" }] } }, { ...ctx, signal: aborted.signal })) === undefined && pending().length === 0);
+check("其它工具的 tool_call 不写请求", (await handlers.tool_call({ toolCallId: "b", toolName: "bash", input: { command: "ls" } }, ctx)) === undefined && pending().length === 0);
+check("重复题目的 questionnaire 不接管", (await handlers.tool_call({ toolCallId: "q4", toolName: "questionnaire",
+  input: { questions: [{ prompt: "Same?", options: [{ label: "A" }] }, { prompt: "Same?", options: [{ label: "B" }] }] } }, ctx)) === undefined);
 
 // 调用方自己的 signal 仍能关闭选择框。
 const own = new AbortController();
@@ -146,7 +213,7 @@ const headless = { select: async () => undefined };
 await handlers.session_start({ reason: "startup" }, { ...ctx, hasUI: false, ui: headless });
 check("无 UI 时不包住 ctx.ui", headless.select.toString().includes("async () => undefined"));
 rmSync(appr, { recursive: true, force: true });
-console.log(`Pi 审批检查：${fails} 项失败`);
+console.log(`Pi 审批与提问检查：${fails} 项失败`);
 clearInterval(alive);
 process.exit(fails === 0 ? 0 : 1);
 '

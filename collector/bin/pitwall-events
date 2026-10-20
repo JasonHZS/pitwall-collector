@@ -281,7 +281,7 @@ cmd_hooks() {
   echo "        prompt 首个非空行的前 80 字、payload 字段名、进程与终端线索（供以后返回原会话）。"
   echo "  不记录：prompt 其余内容、工具参数与输出、assistant 回复、transcript 内容、邮箱等账号信息。"
   echo "  查看脚本：open -e $hook"
-  echo "  审批脚本：$PW_HOME/bin/pitwall-approval；仅在 Pitwall 开启审批且用户点击后返回批准或拒绝。"
+  echo "  审批脚本：$PW_HOME/bin/pitwall-approval；仅在 Pitwall 开启审批且用户点击后返回批准、拒绝或问题的回答。"
   echo "            Claude Code 同时显示原审批框；Codex 的用户审批与 Devin 的交互审批最多先等 60 秒，"
   echo "            自动审查与 devin -p 不接管。Pi 由下方扩展接管允许 / 拒绝提示；Cursor 不接管。"
   list_cfg claude-code "$HOME/.claude/settings.json" nested "Claude Code CLI 与桌面版共用；事件采集异步，审批 hook 同步"
