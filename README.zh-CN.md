@@ -1,6 +1,6 @@
 # Pitwall
 
-Coding Agent 的维修墙。Pitwall 是一个本地 macOS 看板，统一查看 Codex、Claude Code、Cursor、Pi 和 Devin 的会话：每个会话在做什么、哪个需要你处理，一键返回原会话。不需要账号，采集的数据只留在你的 Mac 上。
+Coding Agent 的维修墙。Pitwall 是一个本地 macOS 看板，统一查看 Codex、Claude Code、Cursor、Pi、Devin 和 OpenCode 的会话：每个会话在做什么、哪个需要你处理，一键返回原会话。不需要账号，采集的数据只留在你的 Mac 上。
 
 [官网](https://pitwall.oasislab.dev) · [下载](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [English](README.md)
 
@@ -8,7 +8,7 @@ Coding Agent 的维修墙。Pitwall 是一个本地 macOS 看板，统一查看 
 
 | | 许可 |
 | --- | --- |
-| `collector/`：在你的 Mac 上记录 Agent 事件的 hook 与 Pi 扩展 | [MIT](LICENSE) |
+| `collector/`：在你的 Mac 上记录 Agent 事件的 hook、Pi 扩展与 OpenCode 插件 | [MIT](LICENSE) |
 | [Releases](https://github.com/JasonHZS/pitwall-collector/releases) 中的 `Pitwall.app`：读取这些事件的菜单栏 App | 专有软件，见[使用条款](https://pitwall.oasislab.dev/terms.html) |
 
 采集器开源，方便你核对它究竟记录了什么，也方便社区贡献新 Agent 的接入。App 不开源。
@@ -22,7 +22,7 @@ brew install --cask jasonhzs/tap/pitwall
 pitwall-collector install
 ```
 
-第二条命令为要监督的 Agent 安装事件采集；安装器随 App 附带，修改各 Agent 的配置前会自动备份。不带参数会为所有支持的 Agent 安装，只装其中几个时在后面列出，例如 `pitwall-collector install codex claude-code`。升级用 `brew upgrade --cask pitwall`。
+第二条命令为要监督的 Agent 安装事件采集；安装器随 App 附带，修改各 Agent 的 hook 配置前会自动备份（Pitwall 自有的 Pi 扩展与 OpenCode 插件文件不备份）。不带参数会为所有支持的 Agent 安装，只装其中几个时在后面列出，例如 `pitwall-collector install codex claude-code opencode`。升级用 `brew upgrade --cask pitwall`。
 
 也可以从 [Releases](https://github.com/JasonHZS/pitwall-collector/releases/latest) 下载 `Pitwall.dmg`，拖进“应用程序”。不用 Homebrew 时没有 `pitwall-collector` 命令，改为按路径运行 App 内附带的安装器（Pitwall 设置页里列出了每个 Agent 对应的命令）：
 
@@ -32,9 +32,9 @@ sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh install
 
 从本仓库安装则运行 `sh collector/install.sh install`。
 
-**Codex 需要手动信任一次新 hook。** 打开 Codex CLI，输入 `/hooks`，信任 pitwall 的 hook。新开的 Agent 会话生效；已打开的 Pi 会话可运行 `/reload`。
+**Codex 需要手动信任一次新 hook。** 打开 Codex CLI，输入 `/hooks`，信任 pitwall 的 hook。新开的 Agent 会话生效；已打开的 Pi 会话可运行 `/reload`。OpenCode 会监视插件目录并自动加载 Pitwall 插件。
 
-移除 Pitwall 的 hook 和扩展（事件文件与备份会保留）：
+移除 Pitwall 的 hook 和插件（事件文件与备份会保留）：
 
 ```sh
 pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh uninstall
@@ -49,12 +49,13 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Cursor | IDE 与后台 Agent | 没有可靠信号；不支持在 Pitwall 中审批 | 打开 Cursor |
 | Pi | 终端版 | 支持：扩展请求输入时；允许 / 拒绝类提示可在 Pitwall 中回答 | 终端标签页 |
 | Devin | Devin for Terminal | 交互会话的审批请求支持批准通知；被动状态仍为未知 | 终端标签页 |
+| OpenCode | 2.x 终端 TUI 与 `opencode run` | 权限与表单提示；权限可在 Pitwall 回答，表单需回到 OpenCode | 切换到打开该会话的 OpenCode 客户端所在的 Otty、终端或 iTerm 标签页并显示该会话；否则使用 `opencode -s <sessionID>` 重新打开 |
 
 精准返回标签页支持终端、iTerm2 和 Otty。没有可靠信号时，Pitwall 不会猜测 Agent 正在等你。
 
 ## 采集器如何工作
 
-各 Agent 通过官方 hook 调用 `collector/bin/pitwall-hook`（Pi 通过扩展 API 加载 `collector/pi/pitwall.ts`）。hook 只保留状态字段与简短摘录，向 `~/.pitwall/events/<agent>.jsonl` 追加一行 JSON。它永远不写 stdout、永远以 0 退出，因此不会批准或拒绝任何操作、不会阻塞请求，也不会向 Agent 注入内容。它不发起任何网络请求。
+Claude Code、Codex、Cursor 与 Devin 通过官方 hook 调用 `collector/bin/pitwall-hook`。Pi 使用 `collector/pi/pitwall.ts`；OpenCode 使用 `collector/opencode/pitwall/` 插件：`server.ts` 走 V2 Promise 插件 API，`tui.ts` 在每个终端客户端中报告所显示的会话。采集器只保留状态字段与简短摘录，向 `~/.pitwall/events/<agent>.jsonl` 追加一行 JSON，不发起网络请求。
 
 Claude Code 另登记了 `collector/bin/pitwall-approval`（`PermissionRequest`），让你可以在 Pitwall App 里批准或拒绝请求。Claude Code 同时照常显示自己的审批框，先回答的一方生效。这个 hook 只在你于 Pitwall 中点击“批准”或“拒绝”时作答；Pitwall 没在运行时它立即无输出退出。等待期间，请求只保存在本机的 `~/.pitwall/approvals/`，回答或撤回后删除；用于显示的工具输入 JSON 超过 4000 字符时截断。终端先回答时，有调用 ID 就按 ID 撤回，否则按完整输入的唯一指纹匹配。同一会话曾多次请求相同输入且没有调用 ID 时，保留请求到 hook 退出、轮次 / 会话结束或超时，不按工具名猜测撤回。本机关联标记保留到会话结束，避免迟到事件撤回重复的新请求。请求格式为内部接口，可能随版本变化。
 
@@ -63,6 +64,8 @@ Codex 也在 `PermissionRequest` 登记 `pitwall-approval codex`。重装采集�
 Devin 也在 `PermissionRequest` 登记 `pitwall-approval devin`。与 Codex 一样，Devin 等 hook 返回后才显示原审批框：60 秒内可在 Pitwall 批准 / 拒绝，或从通知横幅批准；未回答时无输出退出，Devin 随即显示原审批框。打印模式（`devin -p`）没有人能回答，立即交回 Devin。Devin 的 payload 不带工作目录，请求记录 `DEVIN_PROJECT_DIR`。`Stop` 只撤回本轮请求，`SessionEnd` 清理整个会话。
 
 Pi 没有审批 hook，审批框来自命令守卫等其它扩展。Pitwall 监听时，`collector/pi/pitwall.ts` 把 Agent 运行中弹出的允许 / 拒绝提示按同一请求格式交给 Pitwall：选项里恰好有一个“允许”和一个“拒绝”的选择框，或确认框。终端选择框照常显示，先回答的一方生效；在 Pitwall 回答会关闭终端选择框，并把对应选项交还给弹框的扩展。审批卡片显示选择框的标题或确认框的标题与正文，不推断工具归属。除下文的提问工具外，扩展不读取或保留工具参数；事件 spool 仍只记录标题的前 120 字。
+
+OpenCode V2 插件在服务端订阅权限事件。Pitwall 可回复一次性允许或拒绝，同时 OpenCode 自己的审批提示保持打开；表单只显示等待状态，仍需回到 OpenCode 回答。服务端插件看不到终端；由 `tui.ts` 报告各终端客户端显示的会话，Pitwall 据此返回原会话。
 
 **提问。** Agent 向你提问时，Pitwall 把题目和选项显示为表单，全部回答后发送。请求带 `answer_format: "answers-v1"`；不带这一标记的旧采集器只提示回到 Agent 回答。提问的输入完整保留、不截断；每道题都有非空回答才会回传。
 
@@ -73,7 +76,7 @@ Pi 没有审批 hook，审批框来自命令守卫等其它扩展。Pitwall 监�
 
 Cursor 不支持：它没有只在需要你确认时触发的 hook，`before*` hook 对每条拟执行命令都会触发。
 
-**记录：** 事件名、时间、会话与轮次 ID、工作目录、transcript 路径、工具名、状态与结束原因、截断的错误信息、请求首行（最多 80 字），以及用于返回原会话的终端线索（tty、`TERM_PROGRAM`）。仅 Claude Code 和 Pi 额外记录：待审批内容的首行（最多 120 字）和最后一条回复的前 160 字，用于在看板上显示“在等什么”和“结果如何”。
+**记录：** 事件名、时间、会话与轮次 ID、工作目录、transcript 路径、工具名、状态与结束原因、截断的错误信息、请求首行（最多 80 字），以及用于返回原会话的终端线索（tty、`TERM_PROGRAM`）。Claude Code、Pi 和 OpenCode 额外记录待审批内容标题（最多 120 字）和最后一条回复的前 160 字，用于在看板上显示“在等什么”和“结果如何”。
 
 **不记录：** 请求的其余内容、工具输入与输出、上述摘录以外的回复、思考过程和 transcript 内容。摘录和路径仍可能含敏感文字，截短不等于脱敏。
 

@@ -20,13 +20,25 @@ fail() { printf '  FAIL %s\n' "$1"; fails=$((fails + 1)); }
 check() { desc=$1; shift; if "$@" >/dev/null 2>&1; then ok "$desc"; else fail "$desc"; fi; }
 jqcheck() { desc=$1 file=$2 prog=$3; check "$desc" "$JQ" -e "$prog" "$file"; }
 count_ours() { "$JQ" '[.. | objects | select(has("command")) | select(.command | contains("pitwall-hook"))] | length' "$1"; }
+backup_groups() (
+  count=0
+  if [ -d "$PITWALL_HOME/backups" ]; then
+    for path in "$PITWALL_HOME/backups"/*; do
+      [ -d "$path" ] && count=$((count + 1))
+    done
+  fi
+  printf '%s' "$count"
+)
 
 # ---- 预置：含用户自己的 hook 和其它设置，验证不被破坏 ----
-mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.cursor" "$HOME/.pi/agent/extensions" "$HOME/.config/devin"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.cursor" "$HOME/.pi/agent/extensions" "$HOME/.config/devin" "$HOME/.config/opencode/plugins"
 printf '%s\n' '{"env":{"FOO":"1"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user-stop-hook"}]}]}}' > "$HOME/.claude/settings.json"
 printf '%s\n' '{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/true user-hook"}]}]}}' > "$HOME/.codex/hooks.json"
 printf '%s\n' '{"version":1,"hooks":{"stop":[{"command":"/usr/bin/true user-hook","type":"command"}]}}' > "$HOME/.cursor/hooks.json"
 printf '%s\n' '{"version":1,"agent":{"model":"swe-2"},"permissions":{"allow":["Read(**)"]},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/usr/bin/true user-devin-hook"}]}]}}' > "$HOME/.config/devin/config.json"
+# 0.6 及更早版本的单文件插件，安装时应被移除。
+printf '%s\n' 'legacy plugin content' > "$HOME/.config/opencode/plugins/pitwall.ts"
+printf '%s\n' 'other plugin content' > "$HOME/.config/opencode/plugins/other.ts"
 for f in .claude/settings.json .codex/hooks.json .cursor/hooks.json .config/devin/config.json; do
   "$JQ" -S . "$HOME/$f" > "$tmp/seed_$(printf '%s' "$f" | tr '/.' '__')"
 done
@@ -56,6 +68,23 @@ check "cursor：6 个 pitwall hook" test "$(count_ours "$R")" = 6
 jqcheck "cursor：保留用户 hook 与 version" "$R" '.version == 1 and ([.hooks.stop[].command] | index("/usr/bin/true user-hook") != null)'
 jqcheck "cursor：不注册带决策语义的 before* 权限 hook" "$R" '.hooks | has("beforeShellExecution") or has("beforeMCPExecution") or has("preToolUse") | not'
 check "pi：扩展已放置" test -f "$HOME/.pi/agent/extensions/pitwall.ts"
+OP="$HOME/.config/opencode/plugins/pitwall"
+check "opencode：插件目录含 server.ts 与 tui.ts 且权限为 644" sh -c "cmp -s '$OP/server.ts' '$root/opencode/pitwall/server.ts' && cmp -s '$OP/tui.ts' '$root/opencode/pitwall/tui.ts' && test \"\$(stat -f %Lp '$OP/tui.ts')\" = 644"
+check "opencode：旧的单文件插件已移除（与目录插件同 ID）" test ! -e "$HOME/.config/opencode/plugins/pitwall.ts"
+op_backups_before=$(backup_groups)
+sh "$root/install.sh" install opencode > "$tmp/opencode-install.txt"
+check "opencode：提示监视插件目录并自动加载" grep -q 'watches the plugin directory' "$tmp/opencode-install.txt"
+op_backups_after=$(backup_groups)
+check "opencode：安装不改动其它插件且不备份自有文件" sh -c "test '$op_backups_before' = '$op_backups_after' && test \"\$(cat '$HOME/.config/opencode/plugins/other.ts')\" = 'other plugin content'"
+absent_opencode="$tmp/no-opencode"
+mkdir -p "$absent_opencode"
+HOME="$absent_opencode" PITWALL_HOME="$absent_opencode/.pitwall" PATH=/usr/bin:/bin sh "$root/install.sh" install opencode > "$tmp/opencode-skip.txt"
+check "opencode：未安装 OpenCode 时提示跳过" sh -c "grep -q 'not found, skipped' '$tmp/opencode-skip.txt' && test ! -e '$absent_opencode/.config/opencode/plugins/pitwall'"
+binary_opencode="$tmp/binary-opencode"
+mkdir -p "$binary_opencode/.opencode/bin"
+printf '#!/bin/sh\n' > "$binary_opencode/.opencode/bin/opencode" && chmod 755 "$binary_opencode/.opencode/bin/opencode"
+HOME="$binary_opencode" PITWALL_HOME="$binary_opencode/.pitwall" PATH=/usr/bin:/bin sh "$root/install.sh" install opencode > /dev/null
+check "opencode：只有 opencode 命令、没有配置目录时也安装插件" cmp -s "$binary_opencode/.config/opencode/plugins/pitwall/server.ts" "$root/opencode/pitwall/server.ts"
 D="$HOME/.config/devin/config.json"
 check "devin：8 个 pitwall hook" test "$(count_ours "$D")" = 8
 jqcheck "devin：保留模型、权限与用户 hook" "$D" '.agent.model == "swe-2" and .permissions.allow == ["Read(**)"] and ([.hooks.Stop[].hooks[].command] | index("/usr/bin/true user-devin-hook") != null)'
@@ -67,7 +96,7 @@ jqcheck "devin：审批 hook 同步执行，timeout 长于脚本 60 秒上限" "
 jqcheck "devin：审批 hook 只登记在 PermissionRequest 与提问的 PreToolUse" "$D" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] | sort == ["PermissionRequest", "PreToolUse"]'
 jqcheck "devin：提问 hook 只匹配 ask_user_question，同步执行" "$D" '[.hooks.PreToolUse[] | select(any(.hooks[]; .command | contains("pitwall-approval")))] == [{matcher: "^ask_user_question$", hooks: [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval devin", timeout: 65}]}]'
 
-sums() { shasum "$C" "$X" "$R" "$D" "$HOME/.pi/agent/extensions/pitwall.ts"; }
+sums() { shasum "$C" "$X" "$R" "$D" "$HOME/.pi/agent/extensions/pitwall.ts" "$OP/server.ts" "$OP/tui.ts"; }
 before=$(sums)
 sh "$root/install.sh" install >/dev/null
 check "重复 install 结果不变" test "$before" = "$(sums)"
@@ -282,6 +311,8 @@ for f in .claude/settings.json .codex/hooks.json .cursor/hooks.json .config/devi
   check "$f 恢复为安装前内容" sh -c "'$JQ' -S . '$HOME/$f' | cmp -s - '$seed'"
 done
 check "pi 扩展已移除" test ! -e "$HOME/.pi/agent/extensions/pitwall.ts"
+check "opencode：只删除 Pitwall 插件文件" sh -c "test ! -e '$OP' && test -f '$HOME/.config/opencode/plugins/other.ts'"
+sh "$root/tests/opencode-tui.sh" || fails=$((fails + 1))
 check "备份目录存在" sh -c "ls -d '$PITWALL_HOME'/backups/* >/dev/null"
 check "pi 扩展不进备份（不是用户配置）" sh -c "! ls '$PITWALL_HOME'/backups/*/pi_pitwall.ts 2>/dev/null"
 
@@ -431,6 +462,7 @@ check "Codex 缺少当前轮 metadata 时直接退出" test -z "$(printf '%s' "$
 sh "$root/tests/codex-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/devin-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/pi-approval.sh" || fails=$((fails + 1))
+sh "$root/tests/opencode-plugin.sh" || fails=$((fails + 1))
 sh "$root/tests/question-approval.sh" || fails=$((fails + 1))
 
 echo "损坏的配置不被覆盖"
@@ -439,21 +471,22 @@ sh "$root/install.sh" install cursor >/dev/null 2>&1 || true
 check "非法 JSON 保持原样" test "$(cat "$R")" = "{ not json"
 # 一个 agent 失败只跳过它自己：排在后面的 agent 照常安装，结尾报告失败并以非零退出。
 bad="$tmp/bad-home"
-mkdir -p "$bad/.cursor" "$bad/.pi/agent" "$bad/.config/devin"
+mkdir -p "$bad/.cursor" "$bad/.pi/agent" "$bad/.config/devin" "$bad/.config/opencode"
 printf '{ not json' > "$bad/.cursor/hooks.json"
 printf '%s\n' '{"hooks":{}}' > "$bad/.config/devin/config.json"
 bad_rc=0
-HOME="$bad" PITWALL_HOME="$bad/.pitwall" sh "$root/install.sh" install cursor pi devin > "$tmp/bad.txt" 2>&1 || bad_rc=$?
+HOME="$bad" PITWALL_HOME="$bad/.pitwall" sh "$root/install.sh" install cursor pi devin opencode > "$tmp/bad.txt" 2>&1 || bad_rc=$?
 check "有 agent 失败时 install 以非零退出" test "$bad_rc" -ne 0
 check "失败的 agent 配置保持原样" test "$(cat "$bad/.cursor/hooks.json")" = "{ not json"
 check "失败之后的 pi 仍被安装" test -f "$bad/.pi/agent/extensions/pitwall.ts"
 check "失败之后的 devin 仍被安装" test "$(count_ours "$bad/.config/devin/config.json")" = 8
+check "失败之后的 opencode 插件仍被安装" test -f "$bad/.config/opencode/plugins/pitwall/server.ts"
 check "备份提示与后续说明照常输出" sh -c "grep -q 'original configs backed up to' '$tmp/bad.txt' && grep -q 'events go to' '$tmp/bad.txt'"
 check "结尾列出失败的 agent" sh -c "tail -2 '$tmp/bad.txt' | grep -q 'install did not finish for: cursor (' && tail -1 '$tmp/bad.txt' | grep -q '未完成安装：cursor（'"
 bad_rc=0
-HOME="$bad" PITWALL_HOME="$bad/.pitwall" sh "$root/install.sh" uninstall cursor pi devin > "$tmp/bad-un.txt" 2>&1 || bad_rc=$?
+HOME="$bad" PITWALL_HOME="$bad/.pitwall" sh "$root/install.sh" uninstall cursor pi devin opencode > "$tmp/bad-un.txt" 2>&1 || bad_rc=$?
 check "有 agent 失败时 uninstall 以非零退出并列出它" sh -c "test $bad_rc -ne 0 && grep -q 'uninstall did not finish for: cursor (' '$tmp/bad-un.txt'"
-check "失败之后的 pi / devin 仍被卸载" sh -c "test ! -e '$bad/.pi/agent/extensions/pitwall.ts' && test \"\$('$JQ' '[.. | objects | select(has(\"command\"))] | length' '$bad/.config/devin/config.json')\" = 0"
+check "失败之后的 pi / devin / opencode 仍被卸载" sh -c "test ! -e '$bad/.pi/agent/extensions/pitwall.ts' && test ! -e '$bad/.config/opencode/plugins/pitwall' && test \"\$('$JQ' '[.. | objects | select(has(\"command\"))] | length' '$bad/.config/devin/config.json')\" = 0"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "全部通过"; else echo "$fails 项失败"; exit 1; fi

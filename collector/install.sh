@@ -1,13 +1,14 @@
 #!/bin/sh
 # 安装 / 卸载 pitwall 的事件采集。
 #
-#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin]   # 不带参数 = 全部
-#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin]
+#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin] [opencode]   # 不带参数 = 全部
+#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode]
 #
 # install：把 hook 脚本和查看工具复制到 ~/.pitwall/bin/，然后在各 agent 的全局配置里
 # 登记 pitwall 的 hook：已登记且一致的条目原样保留（位置不动），缺失或过时的才替换，
 # 重复执行结果不变；其它 hook 原样保留。
-# 任何 agent 配置被改动前，原文件先备份到 ~/.pitwall/backups/<时间>/，只保留最近 10 份。
+# hook 配置被改动前会备份到 ~/.pitwall/backups/<时间>/，只保留最近 10 份；
+# Pi 扩展与 OpenCode 插件是 Pitwall 自有文件，直接覆盖，不备份。
 set -eu
 
 # readlink -f：经 Homebrew 的 pitwall-collector 软链调用时，仍定位到 App 内的 collector 目录。
@@ -25,6 +26,10 @@ CODEX_CFG="$HOME/.codex/hooks.json"
 CURSOR_CFG="$HOME/.cursor/hooks.json"
 PI_EXT="$HOME/.pi/agent/extensions/pitwall.ts"
 DEVIN_CFG="$HOME/.config/devin/config.json"
+# OpenCode 插件目录：server.ts 在后台服务中采集事件，tui.ts 在每个终端客户端中报告所显示的会话。
+OPENCODE_PLUGIN="$HOME/.config/opencode/plugins/pitwall"
+# 0.6 及更早版本安装的单文件插件；与目录插件同 ID，必须移除，否则服务端报重复插件。
+OPENCODE_LEGACY_PLUGIN="$HOME/.config/opencode/plugins/pitwall.ts"
 
 CLAUDE_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PostToolUseFailure","PermissionRequest","PermissionDenied","Notification","Elicitation","Stop","StopFailure"]'
 CLAUDE_TOOL_EVENTS='["PreToolUse","PostToolUse","PostToolUseFailure","PermissionRequest","PermissionDenied"]'
@@ -176,6 +181,16 @@ install_pi() {
   say "pi: extension installed at $PI_EXT (new Pi sessions pick it up; run /reload in open ones; it can answer other extensions' allow / reject prompts from Pitwall)" "pi：扩展已放到 ${PI_EXT}（新开的 Pi 会话生效，已开的会话可 /reload；可在 Pitwall 中回答其它扩展的允许 / 拒绝提示）"
 }
 
+install_opencode() {
+  # OpenCode 不要求用户配置目录存在；装了 opencode 命令或已有配置目录都算已安装。
+  [ -d "$HOME/.config/opencode" ] || [ -x "$HOME/.opencode/bin/opencode" ] || command -v opencode >/dev/null 2>&1 ||
+    { say "opencode: OpenCode not found, skipped" "opencode：未找到 OpenCode，跳过"; return 0; }
+  mkdir -p "$OPENCODE_PLUGIN" &&
+    install -m 644 "$here/opencode/pitwall/server.ts" "$here/opencode/pitwall/tui.ts" "$OPENCODE_PLUGIN/" &&
+    rm -f "$OPENCODE_LEGACY_PLUGIN" || return 1
+  say "opencode: plugin installed at $OPENCODE_PLUGIN (OpenCode watches the plugin directory and picks it up automatically; restart open OpenCode terminals so they can be selected from Pitwall)" "opencode：插件已安装到 ${OPENCODE_PLUGIN}（OpenCode 会监视插件目录并自动加载；重开已打开的 OpenCode 终端后，Pitwall 才能定位到它们）"
+}
+
 # Devin 的 hook 是同步执行的（没有 async）；pitwall-hook 只做一次 jq 追加，并设 10 秒上限。
 # PermissionRequest 另登记 pitwall-approval：Devin 等它返回才显示自己的审批框，脚本最多等 60 秒。
 # PreToolUse 另为 ask_user_question 登记 pitwall-approval（matcher 是正则），提问同样最多等 60 秒。
@@ -226,6 +241,14 @@ uninstall_pi() {
   rm -f "$PI_EXT" && say "pi: extension removed" "pi：已移除扩展"
 }
 
+uninstall_opencode() {
+  [ -e "$OPENCODE_PLUGIN" ] || [ -e "$OPENCODE_LEGACY_PLUGIN" ] || return 0
+  # 只删 Pitwall 自己的文件；目录里若有别的文件，目录保留。
+  rm -f "$OPENCODE_PLUGIN/server.ts" "$OPENCODE_PLUGIN/tui.ts" "$OPENCODE_LEGACY_PLUGIN" &&
+    { [ ! -d "$OPENCODE_PLUGIN" ] || rmdir "$OPENCODE_PLUGIN" 2>/dev/null || true; } &&
+    say "opencode: plugin removed" "opencode：已移除插件"
+}
+
 # 只清理本脚本建的 <日期>-<时间> 目录，按名字排序保留最新的 BACKUP_KEEP 份；其它文件不碰。
 prune_backups() {
   dir="$PW_HOME/backups"
@@ -241,8 +264,8 @@ usage() {
 Install or remove Pitwall's event collection.
 安装或卸载 Pitwall 的事件采集。
 
-  $name install   [claude-code] [codex] [cursor] [pi] [devin]   # no agents = all / 不带参数 = 全部
-  $name uninstall [claude-code] [codex] [cursor] [pi] [devin]
+  $name install   [claude-code] [codex] [cursor] [pi] [devin] [opencode]   # no agents = all / 不带参数 = 全部
+  $name uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode]
 
 install copies the hook scripts and the event viewer to ~/.pitwall/bin/ and registers Pitwall's
 hooks in each agent's global config. Entries already up to date stay where they are, missing or
@@ -266,6 +289,7 @@ run_agent() { # <动作前缀> <agent>
     cursor) "$1"_cursor ;;
     pi) "$1"_pi ;;
     devin) "$1"_devin ;;
+    opencode) "$1"_opencode ;;
     *) say "unknown agent: $2" "未知 agent：$2" ;;
   esac || failed="$failed $2"
 }
@@ -280,7 +304,7 @@ report_failed() {
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
-agents=${*:-claude-code codex cursor pi devin}
+agents=${*:-claude-code codex cursor pi devin opencode}
 
 [ -x "$JQ" ] || { say "needs /usr/bin/jq (part of macOS 15 and later)" "需要 /usr/bin/jq（macOS 15 起系统自带）"; exit 1; }
 

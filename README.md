@@ -1,6 +1,6 @@
 # Pitwall
 
-The pit wall for your coding agents. Pitwall is a local macOS board for Codex, Claude Code, Cursor, Pi and Devin: see what every session is doing, get notified the moment one needs you, and jump back to its session in a click. No account, and what it collects stays on your Mac.
+The pit wall for your coding agents. Pitwall is a local macOS board for Codex, Claude Code, Cursor, Pi, Devin and OpenCode: see what every session is doing, get notified the moment one needs you, and jump back to its session in a click. No account, and what it collects stays on your Mac.
 
 [Website](https://pitwall.oasislab.dev) · [Download](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [中文](README.zh-CN.md)
 
@@ -8,7 +8,7 @@ The pit wall for your coding agents. Pitwall is a local macOS board for Codex, C
 
 | | License |
 | --- | --- |
-| `collector/`: the hooks and the Pi extension that record agent events on your Mac | [MIT](LICENSE) |
+| `collector/`: the hooks, Pi extension and OpenCode plugin that record agent events on your Mac | [MIT](LICENSE) |
 | `Pitwall.app` in [Releases](https://github.com/JasonHZS/pitwall-collector/releases): the menu bar app that reads those events | Proprietary, see the [terms](https://pitwall.oasislab.dev/terms.html) |
 
 The collector is open so you can check exactly what it records, and so support for new agents can be contributed. The app is not open source.
@@ -22,7 +22,7 @@ brew install --cask jasonhzs/tap/pitwall
 pitwall-collector install
 ```
 
-The second command enables event collection for the agents you use; the installer is bundled in the app and backs up each agent's config before changing it. Without arguments it sets up every supported agent; to pick some, list them, e.g. `pitwall-collector install codex claude-code`. Upgrade with `brew upgrade --cask pitwall`.
+The second command enables event collection for the agents you use; the installer is bundled in the app and backs up hook configuration before changing it. Its own Pi and OpenCode plugin files are overwritten without backup. Without arguments it sets up every supported agent; to pick some, list them, e.g. `pitwall-collector install codex claude-code`. Upgrade with `brew upgrade --cask pitwall`.
 
 Or download `Pitwall.dmg` from [Releases](https://github.com/JasonHZS/pitwall-collector/releases/latest) and drag Pitwall to Applications. Without Homebrew there is no `pitwall-collector` command; run the bundled installer by its path instead (Pitwall's Settings lists the command for each agent):
 
@@ -32,9 +32,9 @@ sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh install
 
 To work from this repository, run `sh collector/install.sh install`.
 
-**Codex asks you to trust new hooks once.** Open the Codex CLI, type `/hooks` and trust the pitwall hooks. New agent sessions pick up the hooks; in an open Pi session, run `/reload`.
+**Codex asks you to trust new hooks once.** Open the Codex CLI, type `/hooks` and trust the pitwall hooks. New agent sessions pick up the hooks; in an open Pi session, run `/reload`. OpenCode watches its plugin directory and picks up the Pitwall plugin automatically.
 
-To remove Pitwall's hooks and extension again (event files and backups stay):
+To remove Pitwall's hooks and plugins again (event files and backups stay):
 
 ```sh
 pitwall-collector uninstall   # or, with the DMG: sh /Applications/Pitwall.app/Contents/Resources/collector/install.sh uninstall
@@ -49,12 +49,13 @@ pitwall-collector uninstall   # or, with the DMG: sh /Applications/Pitwall.app/C
 | Cursor | IDE and background agents | No reliable signal; approving from Pitwall isn't supported | Opens Cursor |
 | Pi | Terminal | Yes, when an extension asks for input; allow / reject prompts can be answered from Pitwall | Terminal tab |
 | Devin | Devin for Terminal | Approval notifications for interactive sessions; passive status remains Unknown | Terminal tab |
+| OpenCode | 2.x terminal TUI and `opencode run` | Permission and form prompts; permissions can be answered in Pitwall, forms in OpenCode | Switches to the Otty, Terminal or iTerm tab of the OpenCode client that has the session open, and shows it there; otherwise reopen with `opencode -s <sessionID>` |
 
 Jumping to the exact tab works in Terminal, iTerm2 and Otty. Pitwall doesn't guess: when a signal isn't reliable, it doesn't claim the agent is waiting.
 
 ## How the collector works
 
-Each agent calls `collector/bin/pitwall-hook` through its official hooks (Pi uses `collector/pi/pitwall.ts` through its extension API). The hook keeps status fields and short excerpts and appends one JSON line to `~/.pitwall/events/<agent>.jsonl`. It never writes to stdout and always exits 0, so it can't approve or deny anything, block a prompt or add to the agent's context. It makes no network requests.
+Claude Code, Codex, Cursor and Devin call `collector/bin/pitwall-hook` through their official hooks. Pi uses `collector/pi/pitwall.ts`; OpenCode uses the `collector/opencode/pitwall/` plugin: `server.ts` through the V2 Promise plugin API, and `tui.ts` in each terminal client to report the session it shows. Collectors keep status fields and short excerpts and append one JSON line to `~/.pitwall/events/<agent>.jsonl`. They make no network requests.
 
 For Claude Code, the installer also registers `collector/bin/pitwall-approval` on `PermissionRequest`, so you can approve or deny a request from the Pitwall app. Claude Code shows its own dialog at the same time and the first answer applies. The hook answers only when you click Approve or Deny in Pitwall; if Pitwall isn't running it exits at once without output. While it waits, the request sits in `~/.pitwall/approvals/` on your Mac and is deleted once answered or withdrawn; tool input JSON longer than 4,000 characters is truncated for display. Terminal answers withdraw only a matching call: by call ID when available, otherwise by a unique fingerprint of the complete input. Repeated identical inputs without call IDs stay until the hook exits, the turn or session ends, or the hook times out; they are never withdrawn by tool name alone. Local fingerprint markers stay until the session ends so a late event cannot withdraw a repeated request. The request format is internal and may change between versions.
 
@@ -62,7 +63,7 @@ Codex also registers `pitwall-approval codex` on `PermissionRequest`. Trust the 
 
 Devin also registers `pitwall-approval devin` on `PermissionRequest`. Like Codex, Devin shows its own dialog only after the hook returns: approve or deny in Pitwall, or approve on the notification banner, within 60 seconds; otherwise the hook exits without a decision and Devin's dialog appears. Print mode (`devin -p`) has nobody to answer, so it goes straight back to Devin. Devin's payload has no working directory, so the request records `DEVIN_PROJECT_DIR`. `Stop` withdraws only its own prompt's requests and `SessionEnd` clears the session's.
 
-Pi has no approval hook; its prompts come from other extensions, such as command guards. While Pitwall listens, `collector/pi/pitwall.ts` hands allow / reject prompts raised during an agent run to Pitwall in the same request format: a select prompt with exactly one allow-like and one reject-like option, or a confirm prompt. The terminal prompt stays open and the first answer applies; an answer in Pitwall closes the terminal prompt and passes the matching option back to the extension that asked. Approval cards show the dialog's own title and message without guessing which tool call it belongs to. Apart from the question tools below, the extension does not read or retain tool inputs; the event spool still records only the first 120 characters of the title.
+Pi has no approval hook; its prompts come from other extensions, such as command guards. While Pitwall listens, the Pi extension hands allow / reject prompts raised during an agent run to Pitwall. The terminal prompt stays open and the first answer applies. OpenCode's V2 plugin similarly forwards permission requests while OpenCode's own prompt stays open; Pitwall's `allow` maps to a one-time approval and `deny` to rejection. Forms are visible as waiting status but must be answered in OpenCode. The server plugin can't see terminals; `tui.ts` reports which session each terminal client shows, so Pitwall can return to it.
 
 **Questions.** When an agent asks you something, Pitwall shows the questions and options as a form; send it once every question is answered. Requests carry `answer_format: "answers-v1"`; a collector without it falls back to answering in the agent. Question input is kept whole instead of truncated, and nothing is sent back unless every question has a non-empty answer.
 
@@ -73,11 +74,11 @@ Pi has no approval hook; its prompts come from other extensions, such as command
 
 Cursor isn't supported: it has no hook that fires only when it asks you, and its `before*` hooks run for every proposed command.
 
-**Recorded:** event name, time, session and turn IDs, working directory, transcript path, tool name, status and stop reason, a truncated error, the first line of the prompt (up to 80 characters), and terminal hints (tty, `TERM_PROGRAM`) used to jump back to the session. For Claude Code and Pi only: the first line of a pending approval (up to 120 characters) and the first 160 characters of the final reply, so the board can show what the agent is waiting on and how it finished.
+**Recorded:** event name, time, session and turn IDs, working directory, transcript path, tool name, status and stop reason, a truncated error, the first line of the prompt (up to 80 characters), and terminal hints (tty, `TERM_PROGRAM`) used to jump back to the session. For Claude Code, Pi and OpenCode: the first line of a pending approval (up to 120 characters) and the first 160 characters of the final reply, so the board can show what the agent is waiting on and how it finished.
 
 **Not recorded:** the rest of the prompt, tool inputs and outputs, replies beyond the excerpt above, thinking and transcript contents. Excerpts and paths can still contain sensitive text, since truncating isn't redacting.
 
-Event files grow until you delete them. The installer backs up each config file before changing it (backups can contain sensitive settings); uninstalling removes Pitwall's entries rather than restoring a backup, and leaves event files and backups in place. Details are in the [Privacy Policy](https://pitwall.oasislab.dev/privacy.html).
+Event files grow until you delete them. The installer backs up hook configuration before changing it (backups can contain sensitive settings); its own Pi and OpenCode plugin files are overwritten without backup. Uninstalling removes Pitwall's entries rather than restoring a backup, and leaves event files and backups in place. Details are in the [Privacy Policy](https://pitwall.oasislab.dev/privacy.html).
 
 To see what has been recorded:
 
