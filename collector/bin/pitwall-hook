@@ -179,9 +179,10 @@ if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ];
         PostToolUse | PostToolUseFailure | PermissionDenied)
           set -- "$requests/$scope."*.json
           [ -e "$1" ] || exit 0
+          # 与 pitwall-approval 的指纹一致：提问在原生框里答完后多出的 answers / annotations 不计入。
           canonical=$(printf '%s' "$payload" | "$JQ" -cS '
             select((.tool_name | type) == "string" and (.tool_input | type) == "object")
-            | [.tool_name, .tool_input]' 2>/dev/null)
+            | [.tool_name, (if .tool_name == "AskUserQuestion" then .tool_input | del(.answers, .annotations) else .tool_input end)]' 2>/dev/null)
           if [ -n "$canonical" ]; then
             input_hash=$(printf '%s' "$canonical" | /usr/bin/shasum -a 256 | /usr/bin/cut -d ' ' -f 1)
             tool=$(printf '%s' "$payload" | "$JQ" -r '.tool_name')

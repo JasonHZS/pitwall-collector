@@ -72,6 +72,32 @@ for reply in allow deny '{}' '{"answers":{"选择哪里？":"Agent"}}' '{"answer
 done
 check "无效回答后同样清理" spool_empty
 
+# 在 Claude Code 原生提问框里先回答：PermissionRequest 没有调用 ID，PostToolUse 的输入多出
+# answers / annotations，仍要撤回这条请求；别的问题的完成事件不撤回。
+"$JQ" 'del(.tool_use_id) | .session_id = "native-question-test"' "$tmp/payload.json" > "$tmp/native.json"
+touch "$APPR/listening"
+sh "$APPROVAL" claude-code < "$tmp/native.json" > "$tmp/native.out" &
+started=$!; jobs="$jobs $started"
+i=0
+until set -- "$APPR"/requests/native-question-test.*.json; [ -e "$1" ] || [ "$i" -ge 50 ]; do sleep 0.1; i=$((i + 1)); done
+native_request=$1
+"$JQ" '.hook_event_name = "PostToolUse" | .tool_use_id = "toolu_other" | .tool_input.questions[1].question = "别的问题？"
+  | .tool_input.answers = {"选择哪里？": "Agent", "别的问题？": "无"}' "$tmp/native.json" |
+  sh "$root/bin/pitwall-hook" claude-code PostToolUse
+check "别的问题的完成事件不撤回提问请求" test -e "$native_request"
+"$JQ" '.hook_event_name = "PostToolUse" | .tool_use_id = "toolu_native"
+  | .tool_input.answers = {"选择哪里？": "Agent", "其他要求？": "无"}
+  | .tool_input.annotations = {"选择哪里？": {preview: "x"}}' "$tmp/native.json" |
+  sh "$root/bin/pitwall-hook" claude-code PostToolUse
+i=0
+while [ -e "$native_request" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+check "原生提问框回答后撤回请求" test ! -e "$native_request"
+# 没撤回时让监听过期，审批脚本自行退出，测试不会卡住。
+touch -t "$(date -v-1M +%Y%m%d%H%M.%S)" "$APPR/listening"
+wait "$started"
+check "撤回后审批脚本无输出退出" sh -c 'test ! -e "$1" && test ! -s "$2"' sh "$native_request" "$tmp/native.out"
+check "原生回答撤回后清理" spool_empty
+
 # Codex request_user_input / Devin ask_user_question：PreToolUse 阻止调用，回答写进原因。
 two='{"answers":{"选择哪里？":"Agent, 状态栏","其他要求？":"无"}}'
 "$JQ" '.hook_event_name = "PreToolUse" | .tool_name = "request_user_input" | .turn_id = "t-1"

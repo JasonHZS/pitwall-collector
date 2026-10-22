@@ -84,9 +84,11 @@ id="$(/bin/date +%s)-$$"
 request="$dir/requests/$scope.$tool.$id.json"
 decision="$dir/decisions/$id"
 
+# Claude Code 原生提问框答完后，PostToolUse 的输入多出 answers / annotations；指纹不含这两项，
+# 否则没有调用 ID 的提问请求永远撤不回。与 pitwall-hook 的同一段一字不差，两边一起改。
 canonical=$(printf '%s' "$payload" | "$JQ" -cS '
   select((.tool_name | type) == "string" and (.tool_input | type) == "object")
-  | [.tool_name, .tool_input]' 2>/dev/null)
+  | [.tool_name, (if .tool_name == "AskUserQuestion" then .tool_input | del(.answers, .annotations) else .tool_input end)]' 2>/dev/null)
 [ -n "$canonical" ] || exit 0
 input_hash=$(printf '%s' "$canonical" | /usr/bin/shasum -a 256 | /usr/bin/cut -d ' ' -f 1)
 
