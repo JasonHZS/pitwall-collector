@@ -147,6 +147,31 @@ check_cfg() { # <agent> <配置文件> <期望个数>
   if [ "$c" = "$3" ]; then ok "$1：$c 个 hook 已登记（$2）"; else bad "$1：登记了 $c 个，期望 $3（$2）→ 重跑 collector/install.sh install $1"; fi
 }
 
+# Check capabilities by event and handler, not by a total that can hide a missing hook.
+check_devin_capabilities() {
+  file=$1
+  [ -e "$file" ] || { bad "devin：$file 不存在"; return; }
+  if ! "$JQ" -e 'type == "object" and (.hooks | type == "object")' "$file" >/dev/null 2>&1; then
+    bad "devin：配置无效或 hooks 不可读"; return
+  fi
+  for capability in collection approval question; do
+    if "$JQ" -e --arg capability "$capability" --arg bin "$PW_HOME/bin" '
+      def has($e; $cmd; $matcher; $timeout):
+        any(.hooks[$e][]?; (.matcher // null) == $matcher and
+          any(.hooks[]?; .type == "command" and .command == $cmd and .timeout == $timeout and (has("async") | not)));
+      if $capability == "collection" then
+        . as $config | all(["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PermissionRequest","Stop","PostCompaction"][];
+          . as $event | $config | has($event; $bin + "/pitwall-hook devin " + $event; null; 10))
+      elif $capability == "approval" then has("PermissionRequest"; $bin + "/pitwall-approval devin"; null; 65)
+      else has("PreToolUse"; $bin + "/pitwall-approval devin"; "^ask_user_question$"; 65) end
+    ' "$file" >/dev/null 2>&1; then
+      ok "devin：$capability 已配置（不代表已加载或验证）"
+    else
+      bad "devin：$capability 缺失或不匹配 → 重跑 collector/install.sh install devin"
+    fi
+  done
+}
+
 # Devin 只认这 8 个事件（同 install.sh 的 DEVIN_EVENTS）；hooks 里有别的事件名时整段忽略。
 check_devin_events() { # <配置文件>
   [ -e "$1" ] || return 0
@@ -199,7 +224,7 @@ cmd_doctor() {
   check_cfg claude-code "$HOME/.claude/settings.json" 13
   check_cfg codex "$HOME/.codex/hooks.json" 9
   check_cfg cursor "$HOME/.cursor/hooks.json" 6
-  check_cfg devin "$HOME/.config/devin/config.json" 9
+  check_devin_capabilities "$HOME/.config/devin/config.json"
   check_devin_events "$HOME/.config/devin/config.json"
   if [ -e "$HOME/.pi/agent/extensions/pitwall.ts" ]; then ok "pi：扩展已安装（$HOME/.pi/agent/extensions/pitwall.ts）"; else bad "pi：扩展未安装"; fi
   echo "Codex 信任状态"

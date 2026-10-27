@@ -60,6 +60,9 @@ This file format is the only public interface between the collector and anything
 | `stop_hook_active` | boolean | Claude Code `Stop`: the turn continues because of a stop hook |
 | `background_subagent_running` | boolean | Claude Code `Stop`: a background subagent was still running |
 | `background_task_shapes` | array of strings | Claude Code `Stop`: distinct `type/status` pairs of background tasks, at most 8; values outside `[A-Za-z0-9_.-]{1,40}` become `?` |
+| `tool_use_id` | string | Codex `PreToolUse` of `request_user_input_async`: the call id, if it matches `[A-Za-z0-9_.:-]{1,80}` |
+| `question_count` | number | Codex `PreToolUse` of `request_user_input_async`: how many questions the call asks, at most 16 |
+| `question_replies` | array of objects | Codex `UserPromptSubmit` that answers async questions: `{call_id, index}` of each question answered, at most 16; the questions and answers are not recorded |
 
 ### Short excerpts
 
@@ -69,7 +72,7 @@ These exist so a board can show what a session is about, what it is waiting on a
 | --- | --- | --- |
 | `prompt_head` | string | First non-empty line of the request, truncated to 80. Blocks a client wraps around the request at its start (`<tag …>…</tag>`) are skipped first |
 | `prompt_wrappers` | array of strings | Names of the skipped wrapper tags, at most 8; the contents are not recorded |
-| `tool_summary` | string | Claude Code `PermissionRequest`: first non-empty line of the command, file path or URL being approved, truncated to 120 |
+| `tool_summary` | string | Claude Code `PermissionRequest`: first non-empty line of the command, file path or URL being approved, truncated to 120. Codex `PreToolUse` of `request_user_input_async`: first non-empty line of the first question's title (or its `question` when the title is blank), truncated to 120 |
 | `reply_head` | string | Claude Code `Stop` and Pi `message_end`: the final reply squashed to one line, truncated to 160 |
 
 Nothing else from the request, tool inputs, tool outputs, replies or thinking is recorded. The excerpts above, paths and error text can still contain sensitive information: truncating isn't redacting. Files are never rotated or expired; uninstalling the collector or clearing Pitwall's history leaves them in place.
@@ -92,6 +95,7 @@ Recorded at session start and at the start of each request, to find the terminal
 | `term_program` | `TERM_PROGRAM` |
 | `term_session_id`, `iterm_session_id` | `TERM_SESSION_ID`, `ITERM_SESSION_ID` |
 | `tmux_pane` | `TMUX_PANE` |
+| `tmux_socket` | Local socket path from `TMUX`, excluding the trailing server PID and session number; used with the pane and process tty for returning to a session |
 | `bundle_id` | `__CFBundleIdentifier` of the app that launched the agent |
 | `ghostty_env` | Names (not values) of `GHOSTTY_*` variables |
 

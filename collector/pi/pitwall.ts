@@ -107,6 +107,7 @@ function processContext() {
     term_session_id: env.TERM_SESSION_ID,
     iterm_session_id: env.ITERM_SESSION_ID,
     tmux_pane: env.TMUX_PANE,
+    tmux_socket: env.TMUX && /^\/[^\r\n]*,[0-9]+,[0-9]+$/.test(env.TMUX) ? env.TMUX.replace(/,[0-9]+,[0-9]+$/, "") : undefined,
     bundle_id: env.__CFBundleIdentifier,
     ghostty_env: Object.keys(env).filter((k) => k.startsWith("GHOSTTY_")).join(" ") || undefined,
   };

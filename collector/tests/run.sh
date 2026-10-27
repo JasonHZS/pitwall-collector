@@ -96,6 +96,13 @@ jqcheck "devin：审批 hook 同步执行，timeout 长于脚本 60 秒上限" "
 jqcheck "devin：审批 hook 只登记在 PermissionRequest 与提问的 PreToolUse" "$D" '[.hooks | to_entries[] | select(any(.value[].hooks[]; .command | contains("pitwall-approval"))) | .key] | sort == ["PermissionRequest", "PreToolUse"]'
 jqcheck "devin：提问 hook 只匹配 ask_user_question，同步执行" "$D" '[.hooks.PreToolUse[] | select(any(.hooks[]; .command | contains("pitwall-approval")))] == [{matcher: "^ask_user_question$", hooks: [{type: "command", command: "'"$PITWALL_HOME"'/bin/pitwall-approval devin", timeout: 65}]}]'
 
+"$EVENTS" doctor > "$tmp/devin-doctor.txt" 2>&1
+check "devin：doctor 分别确认三个能力" sh -c "grep -q 'devin：collection 已配置' '$tmp/devin-doctor.txt' && grep -q 'devin：approval 已配置' '$tmp/devin-doctor.txt' && grep -q 'devin：question 已配置' '$tmp/devin-doctor.txt'"
+"$JQ" 'del(.hooks.PreToolUse[] | select(.matcher == "^ask_user_question$"))' "$D" > "$D.new" && mv "$D.new" "$D"
+"$EVENTS" doctor > "$tmp/devin-old-doctor.txt" 2>&1
+check "devin：doctor 能发现旧配置缺提问 hook" sh -c "grep -q 'devin：collection 已配置' '$tmp/devin-old-doctor.txt' && grep -q 'devin：approval 已配置' '$tmp/devin-old-doctor.txt' && grep -q 'devin：question 缺失' '$tmp/devin-old-doctor.txt'"
+sh "$root/install.sh" install devin > /dev/null
+
 sums() { shasum "$C" "$X" "$R" "$D" "$HOME/.pi/agent/extensions/pitwall.ts" "$OP/server.ts" "$OP/tui.ts"; }
 before=$(sums)
 sh "$root/install.sh" install >/dev/null
@@ -160,6 +167,10 @@ feed claude-code UserPromptSubmit '{"session_id":"claude-chrome-literal","prompt
 feed codex UserPromptSubmit '{"session_id":"codex-sess-1","turn_id":"turn-1","cwd":"/tmp/proj-b","hook_event_name":"UserPromptSubmit","prompt":"add tests","permission_mode":"on-request"}'
 feed codex PermissionRequest '{"session_id":"codex-sess-1","turn_id":"turn-1","cwd":"/tmp/proj-b","hook_event_name":"PermissionRequest","tool_name":"exec_command","tool_input":{"cmd":"SECRET-TOKEN-123"}}'
 feed codex Stop '{"session_id":"codex-sess-2","turn_id":"turn-9","cwd":"/tmp/proj-c","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"SECRET-REPLY"}'
+feed codex PreToolUse '{"session_id":"codex-ask","turn_id":"turn-1","hook_event_name":"PreToolUse","tool_name":"request_user_input_async","tool_use_id":"call_abc123","tool_input":{"questions":[{"title":"\n先改文档还是先改代码？\nSECRET-SECOND-LINE","options":["SECRET-OPTION"]},{"title":"SECRET-QUESTION-2"}]}}'
+feed codex PreToolUse '{"session_id":"codex-ask-blank-title","turn_id":"turn-1","hook_event_name":"PreToolUse","tool_name":"request_user_input_async","tool_use_id":"bad id/with spaces","tool_input":{"questions":[{"title":"  ","question":"用哪个分支？"}]}}'
+feed codex UserPromptSubmit '{"session_id":"codex-ask","turn_id":"turn-1","hook_event_name":"UserPromptSubmit","prompt":"<send_user_message_question_reply>\n[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call_abc123\\\",1]\",\"question\":\"SECRET-QUESTION-2\",\"answer\":\"SECRET-ANSWER\"},{\"questionItemId\":\"[\\\"other_tool\\\",\\\"call_x\\\",0]\"}]\n</send_user_message_question_reply>"}'
+feed codex PreToolUse '{"session_id":"codex-ask-other","turn_id":"turn-1","hook_event_name":"PreToolUse","tool_name":"exec_command","tool_input":{"questions":[{"title":"SECRET-NOT-A-QUESTION"}]}}'
 feed cursor beforeSubmitPrompt '{"conversation_id":"cursor-conv-1","generation_id":"gen-1","hook_event_name":"beforeSubmitPrompt","workspace_roots":["/tmp/proj-d"],"prompt":"refactor","user_email":"someone@example.com"}'
 feed cursor stop '{"conversation_id":"cursor-conv-1","generation_id":"gen-1","hook_event_name":"stop","status":"error","workspace_roots":["/tmp/proj-d"],"user_email":"someone@example.com","loop_count":0}'
 feed claude-code SessionStart '{"session_id":"cursor-via-claude","conversation_id":"cursor-via-claude","hook_event_name":"sessionStart","cursor_version":"3.19.13","workspace_roots":["/tmp/proj-d"]}'
@@ -197,7 +208,13 @@ jqcheck "其它 Agent 的同名标题不视为插件上下文" "$CL" 'select(.se
 jqcheck "记录 prompt_id / agent_id / agent_type / is_interrupt" "$CL" 'select(.event == "PostToolUseFailure") | .prompt_id == "prompt-1" and .agent_id == "agent-7" and .agent_type == "general-purpose" and .is_interrupt == true'
 jqcheck "claude PermissionRequest 只记命令首个非空行" "$CL" 'select(.event == "PermissionRequest") | .tool_summary == "rm -rf build/" and .tool_name == "Bash"'
 jqcheck "claude Stop 的回复压成一行、≤ 161 字" "$CL" 'select(.session_id == "claude-reply") | (.reply_head | startswith("已修复登录。 原因是 token 过期 xxx") and length <= 161)'
-check "codex / devin 不记回复与工具摘要" sh -c "! grep -q -e reply_head -e tool_summary '$CX' '$DV'"
+jqcheck "codex 异步提问只记第一题题目的首个非空行" "$CX" 'select(.session_id == "codex-ask" and .event == "PreToolUse") | .tool_summary == "先改文档还是先改代码？" and .tool_name == "request_user_input_async"'
+jqcheck "codex 异步提问记调用 ID 与题数" "$CX" 'select(.session_id == "codex-ask" and .event == "PreToolUse") | .tool_use_id == "call_abc123" and .question_count == 2'
+jqcheck "codex 题目为空时退回 question，非法调用 ID 不记" "$CX" 'select(.session_id == "codex-ask-blank-title") | .tool_summary == "用哪个分支？" and (has("tool_use_id") | not)'
+jqcheck "codex 回答只记所答题目的调用 ID 与序号" "$CX" 'select(.session_id == "codex-ask" and .event == "UserPromptSubmit") | .question_replies == [{"call_id": "call_abc123", "index": 1}] and .prompt_head == "<send_user_message_question_reply>"'
+check "codex 不记选项、其它题目与回答，其它工具不记摘要" sh -c "! grep -q -e SECRET-SECOND-LINE -e SECRET-OPTION -e SECRET-QUESTION-2 -e SECRET-ANSWER -e SECRET-NOT-A-QUESTION '$CX'"
+jqcheck "codex 其它工具不记摘要、调用 ID 与题数" "$CX" 'select(.session_id == "codex-ask-other") | (has("tool_summary") or has("tool_use_id") or has("question_count")) | not'
+check "codex / devin 不记回复，除异步提问外不记工具摘要" "$JQ" -se '([.[] | select(has("reply_head"))] | length == 0) and ([.[] | select(has("tool_summary") and .tool_name != "request_user_input_async")] | length == 0)' "$CX" "$DV"
 jqcheck "记录 payload 字段名" "$CL" 'select(.event == "PreToolUse") | .payload_keys | index("tool_input") != null'
 jqcheck "后台 subagent 只记布尔值与形状，不记详情" "$CL" 'select(.session_id == "claude-bg-running" and .event == "Stop") | .background_subagent_running == true and .background_task_shapes == ["?", "subagent/running"] and (has("background_tasks") | not)'
 check "background_tasks 含非对象元素也不丢事件" "$JQ" -se '[.[] | select(.session_id == "claude-bg-running" and .event == "Stop")] | length == 1 and .[0].parse_error == null and .[0].background_subagent_running == true' "$CL"
@@ -464,6 +481,13 @@ sh "$root/tests/devin-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/pi-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/opencode-plugin.sh" || fails=$((fails + 1))
 sh "$root/tests/question-approval.sh" || fails=$((fails + 1))
+
+echo "tmux terminal hints"
+printf '%s' '{"session_id":"tmux-clue","prompt":"check"}' | PITWALL_HOME="$tmp/tmux-clue" TMUX='/tmp/socket,with-comma,123,0' TMUX_PANE='%3' "$HOOK" codex UserPromptSubmit
+jqcheck "tmux pane 与完整 socket 路径一并保留" "$tmp/tmux-clue/events/codex.jsonl" '.ctx.tmux_pane == "%3" and .ctx.tmux_socket == "/tmp/socket,with-comma"'
+
+printf '%s' '{"session_id":"invalid-tmux"}' | PITWALL_HOME="$tmp/invalid-tmux" TMUX='not-a-socket' "$HOOK" codex UserPromptSubmit
+jqcheck "非法 TMUX 环境值不写入事件" "$tmp/invalid-tmux/events/codex.jsonl" '.ctx.tmux_socket == null'
 
 echo "损坏的配置不被覆盖"
 printf '{ not json' > "$R"

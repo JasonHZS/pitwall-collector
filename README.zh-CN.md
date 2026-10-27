@@ -71,12 +71,13 @@ OpenCode V2 插件在服务端订阅权限事件。Pitwall 可回复一次性允
 
 - Claude Code `AskUserQuestion`（`PermissionRequest`）：终端同时显示原生提问，先回答的一方生效；Pitwall 的回答作为 `updatedInput.answers` 返回。
 - Codex `request_user_input`、Devin `ask_user_question`：安装器在 `PreToolUse` 上为这两个工具单独登记 `pitwall-approval`。两者都等 hook 返回才显示原生提问，请在 60 秒内回答，否则照常显示原生提问。这两个工具的输入不接受回答，所以 hook 阻止这次调用，把你的回答写进模型读到的原因；终端会显示调用被拒绝，后面是你的回答。重新安装后需在 Codex 里信任新 hook。
+- Codex Desktop 用 `request_user_input_async` 提问：它立即返回、Agent 继续工作，所以 Pitwall 不拦截，只把会话显示为等待中并附第一题题目首行，直到你在 Codex 里回答。
 - Pi：Agent 运行中其它扩展弹出的普通选择框（只能选给定选项）与输入框，与审批一样和终端同时等待。Pi 示例中的 `question` / `questionnaire` 工具自绘界面，`tool_call` 先把题目交给 Pitwall 最多 60 秒，作答后以你的回答为原因阻止调用，否则照常显示工具自己的界面。
 - 不支持 Cursor 与 Kimi Code：Cursor 的提问工具尚未与 hook 联调验证，Kimi Code 的 hook 不等待回答。
 
 Cursor 不支持：它没有只在需要你确认时触发的 hook，`before*` hook 对每条拟执行命令都会触发。
 
-**记录：** 事件名、时间、会话与轮次 ID、工作目录、transcript 路径、工具名、状态与结束原因、截断的错误信息、请求首行（最多 80 字），以及用于返回原会话的终端线索（tty、`TERM_PROGRAM`）。Claude Code、Pi 和 OpenCode 额外记录待审批内容标题（最多 120 字）和最后一条回复的前 160 字，用于在看板上显示“在等什么”和“结果如何”。
+**记录：** 事件名、时间、会话与轮次 ID、工作目录、transcript 路径、工具名、状态与结束原因、截断的错误信息、请求首行（最多 80 字），以及用于返回原会话的终端线索（tty、`TERM_PROGRAM`、tmux pane 与本机 socket 路径）。Claude Code、Pi 和 OpenCode 额外记录待审批内容标题（最多 120 字）和最后一条回复的前 160 字；Codex Desktop 额外记录异步提问第一题题目的首行（最多 120 字）以及每条回答所答题目的 ID，用于在看板上显示“在等什么”和“结果如何”。
 
 **不记录：** 请求的其余内容、工具输入与输出、上述摘录以外的回复、思考过程和 transcript 内容。摘录和路径仍可能含敏感文字，截短不等于脱敏。
 

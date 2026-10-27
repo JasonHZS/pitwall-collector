@@ -40,8 +40,11 @@ esac
 # is_interrupt（工具被用户中断）只是标识与布尔值，原样记录。
 # Claude Code 的 Stop 另派生 background_subagent_running 布尔值与 background_task_shapes
 # （type/status 去重、最多 8 个、非法取值记为 ?），不保存任务描述、命令等详情。
-# 例外（仅 Claude Code，用来告诉用户「在等什么」「结果如何」）：PermissionRequest 记 tool_summary
-# （命令 / 文件路径 / URL 的首个非空行，前 120 字），Stop 记 reply_head（最后一条回复压成一行的前 160 字）。
+# 例外（用来告诉用户「在等什么」「结果如何」）：Claude Code 的 PermissionRequest 记 tool_summary
+# （命令 / 文件路径 / URL 的首个非空行，前 120 字），Stop 记 reply_head（最后一条回复压成一行的前 160 字）；
+# Codex Desktop 的异步提问（request_user_input_async 的 PreToolUse）记 tool_summary（第一题题目的首个非空行，前 120 字），
+# 另记 tool_use_id 与题数 question_count；回答（<send_user_message_question_reply> 开头的 UserPromptSubmit）
+# 只记 question_replies：所答题目的调用 ID 与序号，不记题目与回答。
 FILTER='
 def cut($n): if type == "string" and length > $n then .[0:$n] + "…" else . end;
 def text: if type == "string" or type == "null" then . else tojson end;
@@ -66,6 +69,7 @@ def chrome_request:
   else . end;
 def squashed($n): if type == "string" then (gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "") | cut($n)) else null end;
 def blank: if . == "" then null else . end;
+def call_id: if type == "string" and test("^[A-Za-z0-9_.:-]{1,80}$") then . else null end;
 def proc_row: if . == null then null else (capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<tty>\\S+)\\s+(?<comm>.*)$") // null) end;
 if type != "object" then error("payload is not an object") else . end
 # Cursor 会顺带执行 ~/.claude/settings.json 里的 Claude hook（payload 带 cursor_version）；
@@ -78,7 +82,23 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
 | (($event | blank) // $p.hook_event_name) as $ev
 | ($p.background_tasks | if type == "array" then . else null end) as $bg
 | ($p.prompt | prompt_parts) as $prompt
-| {
+| def ask_payload: $agent == "codex" and $ev == "PreToolUse" and $p.tool_name == "request_user_input_async";
+  def questions: $p.tool_input | if type == "object" then (.questions | if type == "array" then . else null end) else null end;
+  # 回答是 JSON 数组，每项的 questionItemId 为 ["request_user_input_async", 调用 ID, 题目序号] 的 JSON 文本。
+  def question_replies:
+    if $agent == "codex" and $ev == "UserPromptSubmit" and ($p.prompt | type) == "string"
+       and ($p.prompt | test("\\A\\s*<send_user_message_question_reply>") or (["send_user_message_question_reply"] | inside($prompt.tags)))
+    then ($p.prompt | capture("<send_user_message_question_reply>(?<body>[\\s\\S]*?)</send_user_message_question_reply>") // null
+          | if . == null then null else (.body | fromjson? // null) end
+          | if type == "array" then
+              [.[] | (if type == "object" then .questionItemId else null end) | (if type == "string" then (fromjson? // null) else null end)
+               | select(type == "array" and length == 3 and .[0] == "request_user_input_async" and (.[1] | call_id) != null
+                        and (.[2] | type == "number" and . == floor and . >= 0 and . < 16))
+               | {call_id: .[1], index: .[2]}]
+              | .[0:16] | if length > 0 then . else null end
+            else null end)
+    else null end;
+  {
     v: 1,
     ts: (now * 1000 | floor),
     agent: $agent,
@@ -124,8 +144,14 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
        then ($p.tool_input
              | if type == "object" then (.command // .file_path // .notebook_path // .url // .path // .pattern) else null end
              | line_head(120) | blank)
+       elif ask_payload
+       then (questions | if . == null then null else .[0] end
+             | if type == "object" then ([.title, .question] | map(line_head(120) | blank) | map(select(. != null)) | .[0]) else null end)
        else null
        end),
+    tool_use_id: (if ask_payload then ($p.tool_use_id | call_id) else null end),
+    question_count: (if ask_payload then (questions | if . == null or length == 0 then null else ([length, 16] | min) end) else null end),
+    question_replies: question_replies,
     reply_head:
       (if $agent == "claude-code" and $ev == "Stop" then ($p.last_assistant_message | squashed(160) | blank) else null end),
     payload_keys: ($p | keys),
@@ -137,6 +163,7 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
       term_session_id: ($term_session_id | blank),
       iterm_session_id: ($iterm_session_id | blank),
       tmux_pane: ($tmux_pane | blank),
+      tmux_socket: ($tmux | if test("^/[^\\r\\n]*,[0-9]+,[0-9]+$") then sub(",[0-9]+,[0-9]+$"; "") else null end),
       bundle_id: ($bundle_id | blank),
       ghostty_env: ($ghostty_env | blank)
     } | with_entries(select(.value != null)))
@@ -150,6 +177,7 @@ line=$(printf '%s' "$payload" | "$JQ" -c \
   --arg proc "$proc" --arg parent_proc "$parent_proc" --arg ghostty_env "$ghostty_env" \
   --arg term_program "${TERM_PROGRAM:-}" --arg term_session_id "${TERM_SESSION_ID:-}" \
   --arg iterm_session_id "${ITERM_SESSION_ID:-}" --arg tmux_pane "${TMUX_PANE:-}" \
+  --arg tmux "${TMUX:-}" \
   --arg bundle_id "${__CFBundleIdentifier:-}" --arg devin_project_dir "${DEVIN_PROJECT_DIR:-}" \
   "$FILTER" 2>/dev/null)
 
