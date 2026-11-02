@@ -481,6 +481,23 @@ sh "$root/tests/devin-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/pi-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/opencode-plugin.sh" || fails=$((fails + 1))
 sh "$root/tests/question-approval.sh" || fails=$((fails + 1))
+# 受支持的桌面运行时同时验证真实 YAML 安装器；其它情况明确报告跳过原因。
+dsh_app=${PITWALL_DSH_APP:-/Applications/DeepSeek Harness.app}
+dsh_runtime="$dsh_app/Contents/Resources/app.asar/dsh/package.json"
+if [ -x "$dsh_app/Contents/MacOS/DeepSeek Harness" ]; then
+  if ELECTRON_RUN_AS_NODE=1 "$dsh_app/Contents/MacOS/DeepSeek Harness" -e \
+    'process.exit(require(process.argv[1]).supportsRuntime(process.argv[2]) ? 0 : 1)' \
+    "$root/deepseek-harness/install.cjs" "$dsh_runtime" 2>/dev/null; then
+    PITWALL_DSH_TEST_RUNTIME="$dsh_runtime" ELECTRON_RUN_AS_NODE=1 \
+      "$dsh_app/Contents/MacOS/DeepSeek Harness" --test "$root/tests/deepseek-navigation.test.mjs" || fails=$((fails + 1))
+  else
+    echo 'DeepSeek Harness runtime is unavailable or outside the plugin compatibility range: installer tests skipped.'
+    node --test "$root/tests/deepseek-navigation.test.mjs" || fails=$((fails + 1))
+  fi
+else
+  echo 'DeepSeek Harness runtime not found: installer tests skipped; set PITWALL_DSH_APP to its .app path to include them.'
+  node --test "$root/tests/deepseek-navigation.test.mjs" || fails=$((fails + 1))
+fi
 
 echo "tmux terminal hints"
 printf '%s' '{"session_id":"tmux-clue","prompt":"check"}' | PITWALL_HOME="$tmp/tmux-clue" TMUX='/tmp/socket,with-comma,123,0' TMUX_PANE='%3' "$HOOK" codex UserPromptSubmit

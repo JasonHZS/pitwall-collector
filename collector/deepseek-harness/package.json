@@ -1,0 +1,15 @@
+{
+  "name": "@pitwall/deepseek-harness-navigation",
+  "version": "1.0.3",
+  "private": true,
+  "engines": { "dsh": ">=0.2.1-rc.3" },
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./client": "./client.js", "./package.json": "./package.json" },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-workspace"]
+    }
+  }
+}
