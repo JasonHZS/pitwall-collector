@@ -1,6 +1,6 @@
 # Pitwall
 
-Coding Agent 的维修墙。Pitwall 是一个本地 macOS 看板，统一查看 Codex、Claude Code、Cursor、Pi、Devin 和 OpenCode 的会话：每个会话在做什么、哪个需要你处理，一键返回原会话。不需要账号，采集的数据只留在你的 Mac 上。
+在 Mac 菜单栏监督你已经在跑的 Coding Agent。Pitwall 在本机统一查看 Codex、Claude Code、Cursor、Pi、OpenCode、Devin、Kimi Code 和 DeepSeek Harness 的会话：谁已完成、失败或需要处理，并在能定位时返回原会话。Cursor 没有可靠的等待信号。不需要账号，采集的数据只留在你的 Mac 上。
 
 [官网](https://pitwall.oasislab.dev) · [下载](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [English](README.md)
 
@@ -15,7 +15,7 @@ Coding Agent 的维修墙。Pitwall 是一个本地 macOS 看板，统一查看 
 
 ## 安装
 
-需要 macOS 15 或更新版本。
+需要 macOS 15 或更新版本，Apple 芯片。
 
 ```sh
 brew install --cask jasonhzs/tap/pitwall
@@ -23,6 +23,10 @@ pitwall-collector install
 ```
 
 第二条命令为要监督的 Agent 安装事件采集；安装器随 App 附带，修改各 Agent 的 hook 配置前会自动备份（Pitwall 自有的 Pi 扩展与 OpenCode 插件文件不备份）。不带参数会为所有支持的 Agent 安装，只装其中几个时在后面列出，例如 `pitwall-collector install codex claude-code opencode`。升级用 `brew upgrade --cask pitwall`。
+
+Kimi Code 的状态直接读它自己的本地日志，不必安装 hook。审批和提问可以显示为等待，但不能在 Pitwall 里作答；返回会话只打开应用，不用会新建对话的链接。
+
+DeepSeek Harness 的状态也直接读本地日志，不必为采集安装插件。提问和审批只能在 Harness 里回答。可选的本地导航插件要在 Pitwall 里同意后才安装，并已在 0.2.1-rc.3 与 rc.5 上核对过按会话 ID 跳转；拒绝、未安装或失败时只打开应用并说明原因。
 
 也可以从 [Releases](https://github.com/JasonHZS/pitwall-collector/releases/latest) 下载 `Pitwall.dmg`，拖进“应用程序”。不用 Homebrew 时没有 `pitwall-collector` 命令，改为按路径运行 App 内附带的安装器（Pitwall 设置页里列出了每个 Agent 对应的命令）：
 
@@ -48,10 +52,14 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Codex | 桌面版、内置 CLI、Chrome 插件 | 用户审批请求支持批准通知；被动状态仍为未知 | 桌面会话，或终端标签页 |
 | Cursor | IDE 与后台 Agent | 没有可靠信号；不支持在 Pitwall 中审批 | 打开 Cursor |
 | Pi | 终端版 | 支持：扩展请求输入时；允许 / 拒绝类提示可在 Pitwall 中回答 | 终端标签页 |
-| Devin | Devin for Terminal | 交互会话的审批请求支持批准通知；被动状态仍为未知 | 终端标签页 |
+| Devin | Devin for Terminal | 不显示为等待。审批期间是状态未知。交互会话有审批通知 | 按 tty 选中终端标签。桌面会话只打开应用 |
 | OpenCode | 2.x 终端 TUI 与 `opencode run` | 权限与表单提示；权限可在 Pitwall 回答，表单需回到 OpenCode | 切换到打开该会话的 OpenCode 客户端所在的 Otty、终端或 iTerm 标签页并显示该会话；否则使用 `opencode -s <sessionID>` 重新打开 |
+| Kimi Code | 桌面版。只读自己的日志，不必装 hook | 审批和提问可以显示为等待。不能在 Pitwall 中作答 | 只打开应用。不用会新建对话的链接 |
+| DeepSeek Harness | 桌面版。状态只读本地日志，不必为采集装插件。可选导航插件已在 0.2.1-rc.3 与 rc.5 核对 | 命令审批与提问显示为等待。只能在 Harness 中回答 | 同意后，可选插件按会话 ID 跳转。否则只打开应用并说明原因 |
 
-精准返回标签页支持终端、iTerm2 和 Otty。没有可靠信号时，Pitwall 不会猜测 Agent 正在等你。
+在 Pitwall 里批准或拒绝覆盖 Claude Code、Codex、Devin、Pi 和 OpenCode。Cursor、Kimi Code 和 DeepSeek Harness 不能在 Pitwall 里作答。
+
+精准返回标签页支持终端、iTerm2 和 Otty，条件是原进程仍占着那个 tty。tmux 要能定位唯一的本机客户端。Ghostty 1.3.1 没有 tty 接口，只打开应用。没有可靠信号时，Pitwall 不会猜测 Agent 正在等你。本机 Homebrew 的 `codex` 命令无法运行，不支持。
 
 ## 采集器如何工作
 

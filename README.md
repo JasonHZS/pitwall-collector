@@ -1,6 +1,6 @@
 # Pitwall
 
-The pit wall for your coding agents. Pitwall is a local macOS board for Codex, Claude Code, Cursor, Pi, Devin and OpenCode: see what every session is doing, get notified the moment one needs you, and jump back to its session in a click. No account, and what it collects stays on your Mac.
+Supervise the coding agents you already run, from the Mac menu bar. Pitwall is a local board for Codex, Claude Code, Cursor, Pi, OpenCode, Devin, Kimi Code and DeepSeek Harness: see which sessions finished, failed, or need you, and jump back when it can tell which session that is. Cursor has no reliable waiting signal. No account, and what it collects stays on your Mac.
 
 [Website](https://pitwall.oasislab.dev) · [Download](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [中文](README.zh-CN.md)
 
@@ -15,7 +15,7 @@ The collector is open so you can check exactly what it records, and so support f
 
 ## Install
 
-Requires macOS 15 or later.
+Requires macOS 15 or later, Apple silicon.
 
 ```sh
 brew install --cask jasonhzs/tap/pitwall
@@ -23,6 +23,8 @@ pitwall-collector install
 ```
 
 The second command enables event collection for the agents you use; the installer is bundled in the app and backs up hook configuration before changing it. Its own Pi and OpenCode plugin files are overwritten without backup. Without arguments it sets up every supported agent; to pick some, list them, e.g. `pitwall-collector install codex claude-code`. Upgrade with `brew upgrade --cask pitwall`.
+
+Kimi Code state collection reads its local logs and does not install a hook. Approvals and questions can show as waiting, but they cannot be answered in Pitwall, and returning to a session only opens the app. It does not use links that start a new chat.
 
 DeepSeek Harness state collection reads its local logs without installing anything. Pitwall separately offers an optional local navigation plugin, with **Agree and Install** and **Decline** choices. Declining keeps app-only navigation and does not change the Harness profile. Settings → Agent keeps installation, repair and removal available. The plugin is bundled with Pitwall, uses Harness's own runtime offline, backs up the profile before editing, and exchanges only short-lived session IDs and navigation results over local files and Harness's existing authenticated local channel. It does not upload conversations, send prompts, answer approvals, or open a new listening port. Main-window navigation between two same-named sessions has been checked on Harness 0.2.1-rc.3 and rc.5; cross-workspace navigation has also been checked on rc.5. Cold-start navigation, notification and failure-HUD acceptance remains pending.
 
@@ -52,10 +54,14 @@ pitwall-collector uninstall   # or, with the DMG: sh /Applications/Pitwall.app/C
 | Codex | Desktop app, built-in CLI, Chrome extension | Approval notifications for user-reviewed requests; passive status remains Unknown | Desktop session, or the terminal tab |
 | Cursor | IDE and background agents | No reliable signal; approving from Pitwall isn't supported | Opens Cursor |
 | Pi | Terminal | Yes, when an extension asks for input; allow / reject prompts can be answered from Pitwall | Terminal tab |
-| Devin | Devin for Terminal | Approval notifications for interactive sessions; passive status remains Unknown | Terminal tab |
+| Devin | Devin for Terminal | Approval notifications for interactive sessions; passive status remains Unknown. Not shown as waiting | Selects the terminal tab by tty. A desktop session only opens the app |
 | OpenCode | 2.x terminal TUI and `opencode run` | Permission and form prompts; permissions can be answered in Pitwall, forms in OpenCode | Switches to the Otty, Terminal or iTerm tab of the OpenCode client that has the session open, and shows it there; otherwise reopen with `opencode -s <sessionID>` |
+| Kimi Code | Desktop app. Reads its own logs; no hook to install | Approvals and questions can show as waiting. Cannot be answered in Pitwall | Opens the app only. Does not use links that start a new chat |
+| DeepSeek Harness | Desktop app. Status is read from local logs; no plugin required for status. Optional navigation plugin checked on 0.2.1-rc.3 and rc.5 | Command approvals and questions show as waiting. Answer only in Harness | After you agree, the optional plugin jumps by session ID. Otherwise it only opens the app and says why |
 
-Jumping to the exact tab works in Terminal, iTerm2 and Otty. Pitwall doesn't guess: when a signal isn't reliable, it doesn't claim the agent is waiting.
+In-app approve or deny covers Claude Code, Codex, Devin, Pi and OpenCode. Cursor, Kimi Code and DeepSeek Harness are not answered in Pitwall.
+
+Jumping to the exact tab works in Terminal, iTerm2 and Otty while the original process still holds that tty. tmux only when one local client can be found. Ghostty 1.3.1 has no tty interface, so Pitwall only opens the app. Pitwall doesn't guess: when a signal isn't reliable, it doesn't claim the agent is waiting. The Homebrew `codex` command does not run on this Mac and is not supported.
 
 ## How the collector works
 

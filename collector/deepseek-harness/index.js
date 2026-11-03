@@ -1,7 +1,8 @@
 // 本地导航桥：不读取消息，不执行任务，不接管审批，也不新增监听端口。
-import { lstat, open, rename, unlink } from 'node:fs/promises';
+// 提问：把自己排到 user-questions/request 应答方链头，Pitwall 监听时先答，超时或出错让位回原生卡片。
+import { lstat, mkdir, open, readFile, rename, rm, stat as statFile, unlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export const inject = ['connection'];
@@ -31,6 +32,71 @@ async function writeJSON(file, value) {
   finally { await unlink(temporary).catch(() => {}); }
 }
 
+// ---- 提问：在 Pitwall 里回答 ask_user_question ----
+//
+// 提问与审批共用同一套 Agent 作用域 waterfall（user-questions/request）：监听者按注册顺序排成
+// 应答方链，返回回答即结案，调用 next() 才把请求让给后面的原生卡片。这里用 prepend 排到链头，
+// Pitwall 监听时先答；Pitwall 没在监听、超时、请求取消或内部出错都 next() 让位，绝不在链上抛错。
+// 定时提问（wait.timed，超时后仍可经 userQuestions.answer 补答）直接让位——原生卡片靠 attachWait
+// 认领剩余时间，我们的等待会吃掉它的窗口；带 intent 的提问（计划评审之类要展示 detail）同样让位。
+const QUESTION_LIMIT_MS = 60_000;
+const safeName = value => typeof value === 'string' ? value.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 128) : '';
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// Pitwall 的表单只接能完整显示的题：id 与题干都非空且不重复，选项标签非空不重复。
+// Harness 的每道题都允许自定义文本（回答里的 custom 字段），allowOther 恒为 true。
+function questionForm(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const ids = new Set(), texts = new Set(), out = [];
+  for (const question of list) {
+    if (question?.intent !== undefined) return null;
+    if (typeof question?.id !== 'string' || question.id === '' || ids.has(question.id)) return null;
+    if (typeof question.question !== 'string' || question.question === '' || texts.has(question.question)) return null;
+    if (question.options !== undefined && !Array.isArray(question.options)) return null;
+    const labels = new Set(), options = [];
+    for (const option of question.options ?? []) {
+      if (typeof option?.label !== 'string' || option.label === '' || labels.has(option.label)) return null;
+      labels.add(option.label);
+      options.push(typeof option.description === 'string' && option.description !== ''
+        ? { label: option.label, description: option.description } : { label: option.label });
+    }
+    ids.add(question.id);
+    texts.add(question.question);
+    out.push({
+      id: question.id, question: question.question,
+      header: typeof question.header === 'string' ? question.header : '',
+      multiSelect: question.multiSelect === true, allowOther: true, options,
+    });
+  }
+  return out;
+}
+
+// 决定文件是 {"answers": [{"id", "selected", "custom"?}]}：每道题恰好一条，selected 只含该题选项。
+// 无效内容不猜、不重试——按没答处理，让位给原生卡片。
+function acceptBatch(questions, text) {
+  let reply;
+  try { reply = JSON.parse(text); } catch { return undefined; }
+  const answers = reply?.answers;
+  if (!Array.isArray(answers) || answers.length !== questions.length) return undefined;
+  const byId = new Map(questions.map(q => [q.id, q]));
+  const seen = new Set(), items = [];
+  for (const item of answers) {
+    const question = typeof item?.id === 'string' ? byId.get(item.id) : undefined;
+    if (!question || seen.has(item.id)) return undefined;
+    seen.add(item.id);
+    const selected = item.selected === undefined ? [] : item.selected;
+    if (!Array.isArray(selected) || !selected.every(label =>
+      typeof label === 'string' && question.options.some(option => option.label === label))) return undefined;
+    const entry = { id: item.id, selected };
+    if (item.custom !== undefined) {
+      if (typeof item.custom !== 'string' || item.custom.trim() === '') return undefined;
+      entry.custom = item.custom;
+    }
+    items.push(entry);
+  }
+  return { answers: items };
+}
+
 export function apply(ctx, config) {
   if (typeof ctx.connection?.fetch?.register !== 'function' || typeof ctx.effect !== 'function') return;
   const directory = config?.directory;
@@ -42,10 +108,16 @@ export function apply(ctx, config) {
   // Serialize writes from overlapping polls; the desktop is the sole consumer.
   let operations = Promise.resolve();
   const respond = value => new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
-  const route = async request => {
+  // 卸载标记一消失（目录、权限或 installed.json 任一项不符），路由与提问应答都让位——
+  // 用户移除安装后 Harness 里已加载的插件还可能在内存里活一会儿，不能继续接管。
+  const installed = async () => {
     const stat = await lstat(directory).catch(() => null);
-    if (disposed || !stat?.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid() || (stat.mode & 0o077)) return new Response(null, { status: 503 });
-    if ((await readJSON(join(directory, 'installed.json')).catch(() => null))?.v !== 1) return new Response(null, { status: 503 });
+    return !!stat?.isDirectory() && !stat.isSymbolicLink() && stat.uid === process.getuid()
+      && !(stat.mode & 0o077)
+      && (await readJSON(join(directory, 'installed.json')).catch(() => null))?.v === 1;
+  };
+  const route = async request => {
+    if (disposed || !(await installed())) return new Response(null, { status: 503 });
     const current = await readJSON(requestFile).catch(() => null);
     if (request.method === 'GET') {
       const compatible = request.headers.get('x-pitwall-navigation-capable') !== 'false';
@@ -86,4 +158,74 @@ export function apply(ctx, config) {
   ctx.effect(() => ctx.connection.fetch.register({ path, methods: ['GET'], requestBody: 'buffered', fetch }), 'Pitwall: navigation requests');
   ctx.effect(() => ctx.connection.fetch.register({ path: `${path}/result`, methods: ['POST'], requestBody: 'streaming', fetch }), 'Pitwall: navigation results');
   ctx.effect(() => () => { disposed = true; }, 'Pitwall: stop session navigation');
+
+  // ---- 提问应答方（~/.pitwall/approvals/，与 hook 协议同一目录） ----
+  const approvals = join(dirname(directory), 'approvals');
+  const questionPending = new Set();
+  let questionSequence = 0;
+  const questionLimitMs = config?.questionWaitMs ?? QUESTION_LIMIT_MS;
+
+  const listening = async () => {
+    try { return Date.now() - (await statFile(join(approvals, 'listening'))).mtimeMs <= 6_000; }
+    catch { return false; }
+  };
+
+  // 写请求文件并轮询决定文件；拿到合法回答、超时、停监听或被取消时结束。
+  const waitForAnswers = async (questions, sessionID, cwd, signal) => {
+    const id = `${Math.floor(Date.now() / 1000)}-${process.pid}-${++questionSequence}`;
+    const requestFile = join(approvals, 'requests', `deepseek-harness.${safeName(sessionID)}.ask_user_question.${id}.json`);
+    const decisionFile = join(approvals, 'decisions', id);
+    const record = {
+      v: 1, id, agent: 'deepseek-harness', created_at: Date.now() / 1000, pid: process.pid,
+      session_id: sessionID, tool_name: 'ask_user_question', answer_format: 'answers-batch-v1',
+      tool_input: { questions },
+      ...(typeof cwd === 'string' && cwd !== '' ? { cwd } : {}),
+    };
+    if (signal?.aborted) return undefined;
+    try {
+      await mkdir(join(approvals, 'requests'), { recursive: true, mode: 0o700 });
+      await mkdir(join(approvals, 'decisions'), { recursive: true, mode: 0o700 });
+      await writeJSON(requestFile, record);
+    } catch { await rm(`${requestFile}`).catch(() => {}); return undefined; }
+    const control = new AbortController();
+    questionPending.add(control);
+    const onAbort = () => control.abort();
+    // abort 事件只发一次：注册监听前先补查，初始化期间错过的取消不会重放。
+    if (signal?.aborted) control.abort();
+    else signal?.addEventListener?.('abort', onAbort, { once: true });
+    const deadline = Date.now() + questionLimitMs;
+    try {
+      while (!disposed && !control.signal.aborted && !signal?.aborted) {
+        const text = await readFile(decisionFile, 'utf8').catch(() => null);
+        if (text !== null) return signal?.aborted ? undefined : acceptBatch(questions, text);
+        if (Date.now() >= deadline || !(await listening()) || !(await installed())) return undefined;
+        await sleep(200);
+      }
+      return undefined;
+    } finally {
+      signal?.removeEventListener?.('abort', onAbort);
+      questionPending.delete(control);
+      await rm(requestFile, { force: true }).catch(() => {});
+      await rm(decisionFile, { force: true }).catch(() => {});
+    }
+  };
+
+  const onQuestion = async function (request, next) {
+    try {
+      const session = request?.agent?.session;
+      const sessionID = plainID(session?.id) ? session.id : '';
+      if (disposed || !sessionID || request.wait !== undefined || request.signal?.aborted
+          || !(await installed()) || !(await listening())) return next();
+      const questions = questionForm(request.questions);
+      if (!questions) return next();
+      const batch = await waitForAnswers(questions, sessionID, session?.cwd, request.signal);
+      return batch ?? next();
+    } catch { return next(); }
+  };
+
+  ctx.effect(() => {
+    if (typeof ctx.on !== 'function') return () => {};
+    const dispose = ctx.on('user-questions/request', onQuestion, { prepend: true });
+    return () => { dispose?.(); for (const control of [...questionPending]) control.abort(); };
+  }, 'Pitwall: answer questions');
 }

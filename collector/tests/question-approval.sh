@@ -68,7 +68,7 @@ n=0
 for reply in allow deny '{}' '{"answers":{"选择哪里？":"Agent"}}' '{"answers":{"选择哪里？":" ","其他要求？":"无"}}'; do
   n=$((n + 1))
   ask "$tmp/payload.json" "bad$n" "$reply"
-  check "无效回答（$reply）不批准问题、无输出" test ! -s "$tmp/bad$n.out"
+  check "无效回答（${reply}）不批准问题、无输出" test ! -s "$tmp/bad$n.out"
 done
 check "无效回答后同样清理" spool_empty
 

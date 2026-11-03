@@ -345,3 +345,193 @@ test('Harness backup retention is independent of hook backups and user directori
   assert.ok(existsSync(join(backups, '20261029-120000')));
   assert.ok(existsSync(join(backups, 'deepseek-user-notes')));
 });
+
+// ---- 提问应答方：user-questions/request 瀑布 ----
+
+function questionBridge(t, { listen = true, questionWaitMs } = {}) {
+  const home = mkdtempSync(join(tmpdir(), 'pitwall-dsh-q-'));
+  const directory = join(home, '.pitwall', 'deepseek-harness');
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(directory, 'installed.json'), '{"v":1}');
+  const approvals = join(home, '.pitwall', 'approvals');
+  const beat = () => { mkdirSync(approvals, { recursive: true }); writeFileSync(join(approvals, 'listening'), ''); };
+  if (listen) beat();
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const listeners = new Map();
+  const disposers = [];
+  const effect = fn => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); };
+  apply({
+    effect,
+    connection: { fetch: { register() { return () => {}; } } },
+    on(name, fn, options) { listeners.set(name, { fn, options }); return () => {}; },
+  }, { directory, ...(questionWaitMs ? { questionWaitMs } : {}) });
+  t.after(() => { for (const dispose of disposers.reverse()) dispose(); });
+  const listener = listeners.get('user-questions/request');
+  assert.ok(listener, 'the plugin registers a question answerer');
+  const agent = { session: { id: 'sess-1', cwd: '/tmp/proj' } };
+  const ask = (questions, extra = {}) => listener.fn.call({}, { agent, questions, ...extra }, () => 'delegated');
+  const requests = () => { try { return readdirSync(join(approvals, 'requests')).filter(f => f.endsWith('.json')); } catch { return []; } };
+  return { approvals, beat, ask, requests, listener, home, directory };
+}
+
+const twoQuestions = [
+  { id: 'q1', question: '哪个方案？', header: '方案', options: [{ label: 'A' }, { label: 'B', description: '慢' }] },
+  { id: 'q2', question: '补充说明', options: [] },
+];
+
+async function pendingRequest(b) {
+  for (let i = 0; i < 80; i++) { if (b.requests().length) return b.requests()[0]; await sleep(25); }
+  assert.fail('request file was not written');
+}
+
+test('Pitwall answers a question and the batch returns through the waterfall', async t => {
+  const b = questionBridge(t);
+  const pending = b.ask(twoQuestions);
+  const file = await pendingRequest(b);
+  const request = JSON.parse(readFileSync(join(b.approvals, 'requests', file)));
+  assert.equal(request.agent, 'deepseek-harness');
+  assert.equal(request.session_id, 'sess-1');
+  assert.equal(request.cwd, '/tmp/proj');
+  assert.equal(request.tool_name, 'ask_user_question');
+  assert.equal(request.answer_format, 'answers-batch-v1');
+  assert.equal(request.pid, process.pid);
+  assert.deepEqual(request.tool_input.questions.map(q => q.id), ['q1', 'q2']);
+  writeFileSync(join(b.approvals, 'decisions', request.id),
+    JSON.stringify({ answers: [{ id: 'q1', selected: ['B'] }, { id: 'q2', selected: [], custom: '都可以' }] }));
+  assert.deepEqual(await pending, { answers: [{ id: 'q1', selected: ['B'] }, { id: 'q2', selected: [], custom: '都可以' }] });
+  assert.equal(existsSync(join(b.approvals, 'requests', file)), false);
+  assert.equal(existsSync(join(b.approvals, 'decisions', request.id)), false);
+});
+
+test('the answerer prepends so Pitwall answers before the native card', async t => {
+  const b = questionBridge(t);
+  assert.equal(b.listener.options?.prepend, true);
+});
+
+test('no Pitwall listener means the native card keeps the request', async t => {
+  const b = questionBridge(t, { listen: false });
+  assert.equal(await b.ask(twoQuestions), 'delegated');
+  assert.deepEqual(b.requests(), []);
+});
+
+test('timed, intented and malformed questions all delegate without writing a request', async t => {
+  const b = questionBridge(t);
+  assert.equal(await b.ask(twoQuestions, { wait: { callId: 'c1', timed: true } }), 'delegated');
+  assert.equal(await b.ask([{ id: 'q1', question: 'Q?', intent: { kind: 'plan-review', approve: 'OK' }, options: [{ label: 'OK' }], detail: 'plan' }]), 'delegated');
+  assert.equal(await b.ask([{ question: 'no id', options: [{ label: 'A' }] }]), 'delegated');
+  assert.equal(await b.ask([{ id: 'q', question: 'same', options: [{ label: 'A' }] }, { id: 'q', question: 'same2', options: [{ label: 'B' }] }]), 'delegated');
+  assert.equal(await b.ask([{ id: 'q', question: 'same', options: [{ label: 'A' }] }, { id: 'q2', question: 'same', options: [{ label: 'B' }] }]), 'delegated');
+  assert.equal(await b.ask('not-an-array'), 'delegated');
+  assert.equal(await b.ask([]), 'delegated');
+  assert.deepEqual(b.requests(), []);
+});
+
+test('an undecided request times out and delegates back to the native card', async t => {
+  const b = questionBridge(t, { questionWaitMs: 300 });
+  const pending = b.ask(twoQuestions);
+  const file = await pendingRequest(b);
+  assert.equal(await pending, 'delegated');
+  assert.equal(existsSync(join(b.approvals, 'requests', file)), false);
+});
+
+test('an invalid answer batch delegates instead of hanging the waterfall', async t => {
+  const b = questionBridge(t);
+  for (const bad of [
+    'not json',
+    JSON.stringify({ answers: [{ id: 'q1', selected: ['A'] }] }),                       // 缺一道题
+    JSON.stringify({ answers: [{ id: 'q1', selected: ['A'] }, { id: 'q1', selected: [] }] }), // 重复 id
+    JSON.stringify({ answers: [{ id: 'q1', selected: ['A'] }, { id: 'q9', selected: [] }] }), // 未知 id
+    JSON.stringify({ answers: [{ id: 'q1', selected: ['Z'] }, { id: 'q2', selected: [] }] }), // 非选项
+  ]) {
+    const pending = b.ask(twoQuestions);
+    const file = await pendingRequest(b);
+    const { id } = JSON.parse(readFileSync(join(b.approvals, 'requests', file)));
+    writeFileSync(join(b.approvals, 'decisions', id), bad);
+    assert.equal(await pending, 'delegated', bad);
+  }
+});
+
+test('stale heartbeat or an aborted signal hands the request back while waiting', async t => {
+  const b = questionBridge(t, { questionWaitMs: 5_000 });
+  const controller = new AbortController();
+  const pending = b.ask(twoQuestions, { signal: controller.signal });
+  await pendingRequest(b);
+  controller.abort();
+  assert.equal(await pending, 'delegated');
+  // 监听过期：等决定时心跳停了也让位。
+  const stale = b.ask(twoQuestions);
+  await pendingRequest(b);
+  rmSync(join(b.approvals, 'listening'), { force: true });
+  assert.equal(await stale, 'delegated');
+});
+
+test('an already-cancelled request delegates without touching Pitwall', async t => {
+  const b = questionBridge(t);
+  assert.equal(await b.ask(twoQuestions, { signal: AbortSignal.abort() }), 'delegated');
+  assert.deepEqual(b.requests(), []);
+});
+
+test('cancelling during setup still delegates and cleans up', async t => {
+  const b = questionBridge(t, { questionWaitMs: 5_000 });
+  const controller = new AbortController();
+  const pending = b.ask(twoQuestions, { signal: controller.signal });
+  controller.abort();
+  assert.equal(await pending, 'delegated');
+  assert.deepEqual(b.requests(), []);
+});
+
+test('removing the install marker makes pending and new questions delegate', async t => {
+  const b = questionBridge(t, { questionWaitMs: 5_000 });
+  const pending = b.ask(twoQuestions);
+  const file = await pendingRequest(b);
+  rmSync(join(b.directory, 'installed.json'));
+  assert.equal(await pending, 'delegated');
+  assert.equal(existsSync(join(b.approvals, 'requests', file)), false);
+  assert.equal(await b.ask(twoQuestions), 'delegated');
+  assert.deepEqual(b.requests(), []);
+});
+
+// 真实 cordis 与 dsh-scope（仅在有 Harness runtime 时）：作用域瀑布确实先到我们、让位才到下游。
+test('a real cordis waterfall answers through Pitwall first and delegates to the native card', { skip: !process.env.PITWALL_DSH_TEST_RUNTIME }, async t => {
+  const runtimeRequire = createRequire(process.env.PITWALL_DSH_TEST_RUNTIME);
+  const { Context } = await import(runtimeRequire.resolve('@deepseek-ai/cordis'));
+  const { scopeTarget } = await import(runtimeRequire.resolve('@deepseek-ai/dsh-scope'));
+  const b = questionBridge(t);
+  const home = mkdtempSync(join(tmpdir(), 'pitwall-dsh-cordis-'));
+  const directory = join(home, '.pitwall', 'deepseek-harness');
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(directory, 'installed.json'), '{"v":1}');
+  const approvals = join(home, '.pitwall', 'approvals');
+  mkdirSync(approvals, { recursive: true });
+  writeFileSync(join(approvals, 'listening'), '');
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+
+  const root = new Context();
+  root.provide('connection');
+  root.set('connection', { fetch: { register() { return () => {}; } } });
+  const seen = [];
+  root.on('user-questions/request', () => { seen.push('native'); return 'native-answer'; });
+  const stop = [];
+  apply({ effect: fn => { const d = fn(); if (typeof d === 'function') stop.push(d); }, on: (...a) => root.on(...a), connection: root.connection }, { directory });
+  t.after(() => { for (const d of stop.reverse()) d(); });
+
+  const agent = { session: { id: 'sess-9', cwd: '/tmp/proj' } };
+  const dispatch = questions => root.waterfall(scopeTarget(root, agent), 'user-questions/request',
+    { agent, questions }, () => 'no-provider');
+  const requests = () => { try { return readdirSync(join(approvals, 'requests')).filter(f => f.endsWith('.json')); } catch { return []; } };
+
+  // Pitwall 作答：原生应答方不触发。
+  const pending = dispatch(twoQuestions);
+  const file = await pendingRequest({ requests });
+  const { id } = JSON.parse(readFileSync(join(approvals, 'requests', file)));
+  writeFileSync(join(approvals, 'decisions', id), JSON.stringify({ answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: [], custom: 'x' }] }));
+  assert.deepEqual(await pending, { answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: [], custom: 'x' }] });
+  assert.deepEqual(seen, []);
+
+  // 没有决定、超时让位：原生应答方接管并把结果传回瀑布。
+  const timedOut = dispatch(twoQuestions);
+  await pendingRequest({ requests });
+  rmSync(join(approvals, 'listening'), { force: true });
+  assert.equal(await timedOut, 'native-answer');
+  assert.deepEqual(seen, ['native']);
+});
