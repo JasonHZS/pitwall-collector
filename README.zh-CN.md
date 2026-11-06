@@ -1,6 +1,6 @@
 # Pitwall
 
-在 Mac 菜单栏监督你已经在跑的 Coding Agent。Pitwall 在本机统一查看 Codex、Claude Code、Cursor、Pi、OpenCode、Devin、Kimi Code 和 DeepSeek Harness 的会话：谁已完成、失败或需要处理，并在能定位时返回原会话。Cursor 没有可靠的等待信号。不需要账号，采集的数据只留在你的 Mac 上。
+在 Mac 菜单栏监督你已经在跑的 Coding Agent。Pitwall 在本机统一查看 Codex、Claude Code、Cursor、Pi、OpenCode、Devin、Kimi Code、DeepSeek Harness 和 Qoder CN 的会话：谁已完成、失败或需要处理，并在能定位时返回原会话。Cursor 没有可靠的等待信号。不需要账号，采集的数据只留在你的 Mac 上。
 
 [官网](https://pitwall.oasislab.dev) · [下载](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [English](README.md)
 
@@ -55,9 +55,10 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Devin | Devin for Terminal | 不显示为等待。审批期间是状态未知。交互会话有审批通知 | 按 tty 选中终端标签。桌面会话只打开应用 |
 | OpenCode | 2.x 终端 TUI 与 `opencode run` | 权限与表单提示；权限可在 Pitwall 回答，表单需回到 OpenCode | 切换到打开该会话的 OpenCode 客户端所在的 Otty、终端或 iTerm 标签页并显示该会话；否则使用 `opencode -s <sessionID>` 重新打开 |
 | Kimi Code | 桌面版。只读自己的日志，不必装 hook | 审批和提问可以显示为等待。不能在 Pitwall 中作答 | 只打开应用。不用会新建对话的链接 |
+| Qoder CN | 独立桌面版 0.5.3；用户级 hooks | 原生提问已实测；新增在 Pitwall 批准 / 拒绝命令与回答问题（60 秒），接管交互待验收 | 只打开应用，未验证精准定位 |
 | DeepSeek Harness | 桌面版。状态只读本地日志，不必为采集装插件。可选导航插件已在 0.2.1-rc.3 与 rc.5 核对 | 命令审批与提问显示为等待。只能在 Harness 中回答 | 同意后，可选插件按会话 ID 跳转。否则只打开应用并说明原因 |
 
-在 Pitwall 里批准或拒绝覆盖 Claude Code、Codex、Devin、Pi 和 OpenCode。Cursor、Kimi Code 和 DeepSeek Harness 不能在 Pitwall 里作答。
+在 Pitwall 里批准或拒绝覆盖 Claude Code、Codex、Devin、Pi、OpenCode 和 Qoder CN；Qoder CN 的接管交互待真实验收。Cursor、Kimi Code 和 DeepSeek Harness 的审批不能在 Pitwall 里作答。
 
 精准返回标签页支持终端、iTerm2 和 Otty，条件是原进程仍占着那个 tty。tmux 要能定位唯一的本机客户端。Ghostty 1.3.1 没有 tty 接口，只打开应用。没有可靠信号时，Pitwall 不会猜测 Agent 正在等你。本机 Homebrew 的 `codex` 命令无法运行，不支持。
 
@@ -79,13 +80,14 @@ OpenCode V2 插件在服务端订阅权限事件。Pitwall 可回复一次性允
 
 - Claude Code `AskUserQuestion`（`PermissionRequest`）：终端同时显示原生提问，先回答的一方生效；Pitwall 的回答作为 `updatedInput.answers` 返回。
 - Codex `request_user_input`、Devin `ask_user_question`：安装器在 `PreToolUse` 上为这两个工具单独登记 `pitwall-approval`。两者都等 hook 返回才显示原生提问，请在 60 秒内回答，否则照常显示原生提问。这两个工具的输入不接受回答，所以 hook 阻止这次调用，把你的回答写进模型读到的原因；终端会显示调用被拒绝，后面是你的回答。重新安装后需在 Codex 里信任新 hook。
+- Qoder CN `AskUserQuestion`：精确匹配的 `PreToolUse` hook 最多等 60 秒，然后阻止调用并把用户回答写进模型反馈；命令审批走 `PermissionRequest` allow / deny。更新 / 修复接入后新开任务生效；真实桌面接管交互待验收。
 - Codex Desktop 用 `request_user_input_async` 提问：它立即返回、Agent 继续工作，所以 Pitwall 不拦截，只把会话显示为等待中并附第一题题目首行，直到你在 Codex 里回答。
 - Pi：Agent 运行中其它扩展弹出的普通选择框（只能选给定选项）与输入框，与审批一样和终端同时等待。Pi 示例中的 `question` / `questionnaire` 工具自绘界面，`tool_call` 先把题目交给 Pitwall 最多 60 秒，作答后以你的回答为原因阻止调用，否则照常显示工具自己的界面。
 - 不支持 Cursor 与 Kimi Code：Cursor 的提问工具尚未与 hook 联调验证，Kimi Code 的 hook 不等待回答。
 
 Cursor 不支持：它没有只在需要你确认时触发的 hook，`before*` hook 对每条拟执行命令都会触发。
 
-**记录：** 事件名、时间、会话与轮次 ID、工作目录、transcript 路径、工具名、状态与结束原因、截断的错误信息、请求首行（最多 80 字），以及用于返回原会话的终端线索（tty、`TERM_PROGRAM`、tmux pane 与本机 socket 路径）。Claude Code、Pi 和 OpenCode 额外记录待审批内容标题（最多 120 字）和最后一条回复的前 160 字；Codex Desktop 额外记录异步提问第一题题目的首行（最多 120 字）以及每条回答所答题目的 ID，用于在看板上显示“在等什么”和“结果如何”。
+**记录：** 事件名、时间、会话与轮次 ID、工作目录、transcript 路径、工具名、状态与结束原因、截断的错误信息、请求首行（最多 80 字），以及用于返回原会话的终端线索（tty、`TERM_PROGRAM`、tmux pane 与本机 socket 路径）。Claude Code、Pi、OpenCode 和 Qoder CN 额外记录待审批内容标题（最多 120 字）和最后一条回复的前 160 字；Codex Desktop 额外记录异步提问第一题题目的首行（最多 120 字）以及每条回答所答题目的 ID，用于在看板上显示“在等什么”和“结果如何”。
 
 **不记录：** 请求的其余内容、工具输入与输出、上述摘录以外的回复、思考过程和 transcript 内容。摘录和路径仍可能含敏感文字，截短不等于脱敏。
 
@@ -110,3 +112,11 @@ Cursor 不支持：它没有只在需要你确认时触发的 hook，`before*` h
 ## 许可
 
 本仓库中的代码以 [MIT](LICENSE) 许可证发布。Pitwall 名称、图标以及 Releases 中的 App 二进制不在此许可范围内。
+
+## Qoder CN
+
+用 `sh collector/install.sh install qoder-cn` 接入，`sh collector/install.sh uninstall qoder-cn` 卸载。修改 `~/.qoder-cn/settings.json` 前备份，保留其它设置与 hooks，重复安装不改顺序。新开任务生效；必要时重启 Qoder CN。卸载不删除采集事件与备份。
+
+独立桌面版 0.5.3 已验证开始、完成、中断、原生提问与前台子 Agent。`Stop` 只作回复预览，最终结果由 `QueryEnd` 确认；原生等待通知按工具调用 ID 关联，避免并发工具返回误清等待。另登记同步审批与提问 hook，可在 Pitwall 中于 60 秒内批准 / 拒绝或回答，否则不输出决定并交回 Qoder 原生流程。未监听、不支持的提问、无效决定也交回原生流程；子 Agent 不接管。权限卡片、接管交互和致命错误尚待真实验证。IDE、CLI 与国际版不继承结论。
+
+请求 / 等待 / 回复摘要分别最多 80 / 120 / 160 字；采集器不把完整工具 payload 或审批文件复制到事件，App 不扫描 Qoder CN 的项目聊天文件。待批输入（显示 JSON 超过 4000 字符截断）、完整题目与选项、回答暂存在 `~/.pitwall/approvals/`，处理 / 撤回 / 超时后删除；输入指纹标记保留到会话结束。回答会交给模型，模型可能在回复中复述答案，使其进入事件的回复摘录及 App 任务历史；删除审批文件不会清除这些摘录。已有只观察安装需更新 / 修复，以登记两个决策 hook。

@@ -1,9 +1,10 @@
 #!/bin/sh
-# pitwall-approval：把 Claude Code / Codex / Devin 的审批请求与提问交给 Pitwall，等用户批准、拒绝或回答。
+# pitwall-approval：把 Claude Code / Codex / Devin / Qoder CN 的审批请求与提问交给 Pitwall。
 #
 #   pitwall-approval claude-code    # PermissionRequest 的 payload 从 stdin 传入
 #   pitwall-approval codex          # Codex 在 hook 返回后才显示原生审批框
 #   pitwall-approval devin          # Devin 同样在 hook 返回后才显示原生审批框
+#   pitwall-approval qoder-cn       # 独立桌面版：PermissionRequest 审批、PreToolUse 提问
 #
 # Pi 没有 hook 审批：它的审批框来自其它扩展，由 Pitwall 的 Pi 扩展（pi/pitwall.ts）按同一文件格式接管。
 #
@@ -25,7 +26,12 @@ LIMIT=900          # 最长等待秒数；登记的 hook timeout 略长于它
 
 payload=$(/bin/cat)
 [ -x "$JQ" ] || exit 0
-case "$agent" in claude-code | codex | devin) ;; *) exit 0 ;; esac
+case "$agent" in claude-code | codex | devin | qoder-cn) ;; *) exit 0 ;; esac
+# 与 Qoder CN 的状态采集边界一致：不接管子 Agent 请求；仅接管这两个决策事件。
+if [ "$agent" = qoder-cn ]; then
+  printf '%s' "$payload" | "$JQ" -e '
+    .agent_id == null and (.hook_event_name == "PermissionRequest" or .hook_event_name == "PreToolUse")' >/dev/null 2>&1 || exit 0
+fi
 
 listening() {
   beat=$(/usr/bin/stat -f %m "$dir/listening" 2>/dev/null) || return 1
@@ -50,9 +56,27 @@ tool=${rest#* }
 # 既不能回答也不能批准，立即交回原生界面，不让它白等 60 秒。
 question=false
 case "$agent:$event:$tool" in
-  claude-code:PermissionRequest:AskUserQuestion | codex:PreToolUse:request_user_input | devin:PreToolUse:ask_user_question) question=true ;;
-  codex:PermissionRequest:request_user_input | devin:PermissionRequest:ask_user_question | *:PreToolUse:*) exit 0 ;;
+  claude-code:PermissionRequest:AskUserQuestion | codex:PreToolUse:request_user_input | devin:PreToolUse:ask_user_question | qoder-cn:PreToolUse:AskUserQuestion) question=true ;;
+  codex:PermissionRequest:request_user_input | devin:PermissionRequest:ask_user_question | qoder-cn:PermissionRequest:AskUserQuestion | *:PreToolUse:*) exit 0 ;;
 esac
+
+# 未知的 Qoder 提问格式直接回原生卡片，避免没有可填写的表单却等待 60 秒。
+if [ "$agent" = qoder-cn ] && [ "$question" = true ]; then
+  printf '%s' "$payload" | "$JQ" -e '
+    .tool_input.questions as $q
+    | ($q | type) == "array" and ($q | length) > 0 and ($q | length) <= 4
+      and all($q[]; (.question | type) == "string" and (.question | length) > 0
+        and (.id == null or (.id | type) == "string")
+        and (.header == null or (.header | type) == "string")
+        and (.multiSelect == null or (.multiSelect | type) == "boolean")
+        and (.multi_select == null or (.multi_select | type) == "boolean")
+        and (.allowOther == null or (.allowOther | type) == "boolean")
+        and (.options | type) == "array" and (.options | length) > 0
+        and all(.options[]; (.label | type) == "string" and (.label | length) > 0
+          and (.description == null or (.description | type) == "string"))
+        and ([.options[].label] | unique | length) == (.options | length))
+      and ([$q[].question] | unique | length) == ($q | length)' >/dev/null 2>&1 || exit 0
+fi
 
 # Codex 的自动审查也触发 PermissionRequest。只接管明确交给用户的当前轮，
 # 缺少 metadata / 元数据太远 / 格式未知时立即交回 Codex，不延迟自动审查。
@@ -104,7 +128,7 @@ printf '%s' "$payload" | "$JQ" -c --arg id "$id" --arg agent "$agent" --argjson 
   --arg project "${DEVIN_PROJECT_DIR:-}" --argjson question "$question" '
   def cap: if (tojson | length) > 4000 then {_truncated: (tojson | .[0:4000])} else . end;
   {v: 1, id: $id, agent: $agent, created_at: now, pid: $pid, session_id,
-   turn_id: (if $agent == "devin" then .prompt_id else .turn_id end),
+   turn_id: (if $agent == "devin" then .prompt_id elif $agent == "qoder-cn" then .request_set_id else .turn_id end),
    cwd: (.cwd // (if $agent == "devin" and $project != "" then $project else null end)),
    answer_format: (if $question then "answers-v1" else null end),
    permission_mode, tool_name, tool_input: (if $question then .tool_input else (.tool_input | cap) end),
@@ -118,6 +142,8 @@ trap 'cleanup; exit 0' HUP INT TERM
 
 start=$(/bin/date +%s)
 while :; do
+  # 撤回、退出或超时优先于迟到的决定；旧卡片不能恢复已结束的调用。
+  [ -f "$request" ] && listening && [ $(($(/bin/date +%s) - start)) -lt "$LIMIT" ] || { cleanup; exit 0; }
   if [ -f "$decision" ]; then
     if [ "$question" = true ]; then
       # Answer envelopes are valid only for this exact question request: every question answered, nothing extra.
@@ -134,7 +160,7 @@ while :; do
         | if $agent == "claude-code" then
             {hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {
               behavior: "allow", updatedInput: ($input + {answers: $answers})}}}
-          elif $agent == "codex" then
+          elif $agent == "codex" or $agent == "qoder-cn" then
             {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $said}}
           else {decision: "block", reason: $said} end' 2>/dev/null
       cleanup
@@ -148,7 +174,5 @@ while :; do
     esac
     exit 0
   fi
-  # 请求被撤回（终端里已回答）、Pitwall 退出，或等太久：不输出，交给终端的审批框。
-  [ -f "$request" ] && listening && [ $(($(/bin/date +%s) - start)) -lt "$LIMIT" ] || { cleanup; exit 0; }
   /bin/sleep 0.2
 done

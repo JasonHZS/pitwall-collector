@@ -1,8 +1,8 @@
 #!/bin/sh
 # 安装 / 卸载 pitwall 的事件采集。
 #
-#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin] [opencode]   # 不带参数 = 全部
-#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode]
+#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]   # 不带参数 = 全部
+#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]
 #
 # install：把 hook 脚本和查看工具复制到 ~/.pitwall/bin/，然后在各 agent 的全局配置里
 # 登记 pitwall 的 hook：已登记且一致的条目原样保留（位置不动），缺失或过时的才替换，
@@ -26,6 +26,7 @@ CODEX_CFG="$HOME/.codex/hooks.json"
 CURSOR_CFG="$HOME/.cursor/hooks.json"
 PI_EXT="$HOME/.pi/agent/extensions/pitwall.ts"
 DEVIN_CFG="$HOME/.config/devin/config.json"
+QODER_CN_CFG="$HOME/.qoder-cn/settings.json"
 # OpenCode 插件目录：server.ts 在后台服务中采集事件，tui.ts 在每个终端客户端中报告所显示的会话。
 OPENCODE_PLUGIN="$HOME/.config/opencode/plugins/pitwall"
 # 0.6 及更早版本安装的单文件插件；与目录插件同 ID，必须移除，否则服务端报重复插件。
@@ -40,6 +41,9 @@ CURSOR_EVENTS='["sessionStart","sessionEnd","beforeSubmitPrompt","postToolUse","
 # Devin 会整段忽略 hooks 设置——连同用户自己的 hook。所以这里只登记这 8 个、不写 async；
 # matcher 是正则，只在提问 hook 上写精确的工具名（Claude 格式的 "*" 不是合法正则）。
 DEVIN_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PermissionRequest","Stop","PostCompaction"]'
+
+# Qoder CN 0.5.3：QueryEnd 为最终轮次事件；审批与提问各自登记同步 hook。
+QODER_CN_EVENTS='["SessionStart","SessionEnd","UserPromptSubmit","PreToolUse","PostToolUse","PostToolUseFailure","PermissionRequest","PermissionDenied","Notification","Stop","StopFailure","QueryEnd"]'
 
 # pitwall 的 handler 以命令里含 pitwall-hook / pitwall-approval 识别；Claude/Codex 是两层结构，Cursor 是一层。
 JQ_DEFS='
@@ -214,6 +218,28 @@ install_devin() {
   [ -z "$extra" ] || say "  ✗ devin: hooks contain events Devin does not know ($extra), so Devin ignores all hooks; remove those events by hand" "  ✗ devin：hooks 含 Devin 不认识的事件（${extra}），Devin 会忽略全部 hooks；请手动移除这些事件"
 }
 
+install_qoder_cn() {
+  [ -d "$HOME/.qoder-cn" ] || { say "qoder-cn: ~/.qoder-cn not found, skipped" "qoder-cn：未找到 ~/.qoder-cn，跳过"; return 0; }
+  edit_json "$QODER_CN_CFG" '
+    prune_nested($events)
+    | reduce $events[] as $e (.;
+        ensure_nested_all($e;
+          [{hooks: [{type: "command", command: ($hook + " qoder-cn " + $e), timeout: 10}]}]
+          + (if $e == "PermissionRequest" then
+               [{hooks: [{type: "command", command: ($approval + " qoder-cn"), timeout: 65}]}]
+             elif $e == "PreToolUse" then
+               [{matcher: "^AskUserQuestion$", hooks: [{type: "command", command: ($approval + " qoder-cn"), timeout: 65}]}]
+             else [] end)))' \
+    --argjson events "$QODER_CN_EVENTS" --arg hook "$HOOK" --arg approval "$APPROVAL" || return 1
+  say "qoder-cn: hooks installed; approvals and questions wait up to 60 seconds in Pitwall; start a new task (restart Qoder CN if needed)" "qoder-cn：已安装 hooks；审批与提问在 Pitwall 中最多等待 60 秒；请新开任务（必要时重启 Qoder CN）"
+}
+
+uninstall_qoder_cn() {
+  [ -e "$QODER_CN_CFG" ] || return 0
+  edit_json "$QODER_CN_CFG" 'strip_nested | if .hooks == {} then del(.hooks) else . end' &&
+    say "qoder-cn: pitwall hooks removed" "qoder-cn：已移除 pitwall hook"
+}
+
 uninstall_claude() {
   [ -e "$CLAUDE_CFG" ] || return 0
   edit_json "$CLAUDE_CFG" 'strip_nested | if .hooks == {} then del(.hooks) else . end' &&
@@ -264,8 +290,8 @@ usage() {
 Install or remove Pitwall's event collection.
 安装或卸载 Pitwall 的事件采集。
 
-  $name install   [claude-code] [codex] [cursor] [pi] [devin] [opencode]   # no agents = all / 不带参数 = 全部
-  $name uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode]
+  $name install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]   # no agents = all / 不带参数 = 全部
+  $name uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]
 
 install copies the hook scripts and the event viewer to ~/.pitwall/bin/ and registers Pitwall's
 hooks in each agent's global config. Entries already up to date stay where they are, missing or
@@ -290,6 +316,7 @@ run_agent() { # <动作前缀> <agent>
     pi) "$1"_pi ;;
     devin) "$1"_devin ;;
     opencode) "$1"_opencode ;;
+    qoder-cn) "$1"_qoder_cn ;;
     *) say "unknown agent: $2" "未知 agent：$2" ;;
   esac || failed="$failed $2"
 }
@@ -304,7 +331,7 @@ report_failed() {
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
-agents=${*:-claude-code codex cursor pi devin opencode}
+agents=${*:-claude-code codex cursor pi devin opencode qoder-cn}
 
 [ -x "$JQ" ] || { say "needs /usr/bin/jq (part of macOS 15 and later)" "需要 /usr/bin/jq（macOS 15 起系统自带）"; exit 1; }
 

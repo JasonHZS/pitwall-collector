@@ -13,7 +13,7 @@ set -eu
 JQ=/usr/bin/jq
 PW_HOME=${PITWALL_HOME:-$HOME/.pitwall}
 EVENTS_DIR="$PW_HOME/events"
-AGENTS="claude-code codex cursor pi devin"
+AGENTS="claude-code codex cursor pi devin qoder-cn"
 
 JQ_LIB='
 def ts_local: (.ts / 1000 | localtime | strftime("%m-%d %H:%M:%S"));
@@ -31,7 +31,11 @@ def event_line: "\(ts_local)  \(.agent | pad(11)) \(.event | pad(20)) \(short_si
 # keep = 不改变状态，settled = Pi 本轮结束（沿用之前的失败/取消）。
 def classify:
   .event as $ev
-  | if ($ev | test("^(SessionEnd|sessionEnd|session_shutdown)$")) then "closed"
+  | if .agent == "qoder-cn" and $ev == "QueryEnd" then
+        (if .reason == "end_turn" then "done" elif .reason == "abort" then "cancelled" elif .reason == "error" then "failed" else "unknown" end)
+    elif .agent == "qoder-cn" and $ev == "Stop" then "keep"
+    elif .agent == "qoder-cn" and ($ev == "PermissionRequest" or $ev == "StopFailure") then "unknown"
+    elif ($ev | test("^(SessionEnd|sessionEnd|session_shutdown)$")) then "closed"
     elif $ev == "PermissionRequest" or $ev == "Elicitation" or $ev == "ui_prompt_start"
          or ($ev == "Notification" and (.notification_type == "permission_prompt" or .notification_type == "elicitation_dialog"))
       then "waiting"
@@ -46,7 +50,9 @@ def classify:
     else "running" end;
 def step($prev; $e):
   ($e | classify) as $c
-  | if $c == "keep" then $prev
+  | if $e.agent == "qoder-cn" and ($prev == "done" or $prev == "failed" or $prev == "cancelled")
+       and $c == "running" and $e.event != "UserPromptSubmit" then $prev
+    elif $c == "keep" then $prev
     elif $c == "settled" then (if $prev == "failed" or $prev == "cancelled" then $prev else "done" end)
     elif $c == "idle" then (if $prev == null or $prev == "closed" then "idle" else $prev end)
     else $c end;
@@ -224,6 +230,7 @@ cmd_doctor() {
   check_cfg claude-code "$HOME/.claude/settings.json" 13
   check_cfg codex "$HOME/.codex/hooks.json" 9
   check_cfg cursor "$HOME/.cursor/hooks.json" 6
+  check_cfg qoder-cn "$HOME/.qoder-cn/settings.json" 14
   check_devin_capabilities "$HOME/.config/devin/config.json"
   check_devin_events "$HOME/.config/devin/config.json"
   if [ -e "$HOME/.pi/agent/extensions/pitwall.ts" ]; then ok "pi：扩展已安装（$HOME/.pi/agent/extensions/pitwall.ts）"; else bad "pi：扩展未安装"; fi
@@ -252,7 +259,7 @@ HOOK_DESC='{
     "PreToolUse": "工具执行前", "PostToolUse": "工具执行后", "PostToolUseFailure": "工具执行失败",
     "PermissionRequest": "请求审批（可能自动审查）", "PermissionDenied": "权限被拒绝",
     "Notification": "通知，含等待审批/等待输入", "Elicitation": "MCP 工具请求你输入",
-    "Stop": "本轮回复结束", "StopFailure": "本轮因错误结束", "Interrupt": "本轮被中断", "PostCompaction": "上下文压缩完成",
+    "QueryEnd": "Qoder CN 顶层轮次最终结果", "Stop": "本轮回复结束", "StopFailure": "本轮因错误结束", "Interrupt": "本轮被中断", "PostCompaction": "上下文压缩完成",
     "sessionStart": "会话开始", "sessionEnd": "会话结束", "beforeSubmitPrompt": "提交 prompt（任务开始）",
     "postToolUse": "工具执行后", "postToolUseFailure": "工具执行失败", "stop": "本轮结束（成功/出错/中止）",
     "session_start": "会话开始", "session_shutdown": "会话关闭", "before_agent_start": "提交 prompt（任务开始）",
@@ -312,6 +319,7 @@ cmd_hooks() {
   list_cfg claude-code "$HOME/.claude/settings.json" nested "Claude Code CLI 与桌面版共用；事件采集异步，审批 hook 同步"
   list_cfg codex "$HOME/.codex/hooks.json" nested "Codex Desktop 与 CLI 共用；在 Codex 设置 → 钩子 里信任后才运行（信任状态见 doctor）"
   list_cfg cursor "$HOME/.cursor/hooks.json" flat "Cursor IDE 与 cursor-agent 共用；只记录，不做决策"
+  list_cfg qoder-cn "$HOME/.qoder-cn/settings.json" nested "Qoder CN：审批与提问在 Pitwall 最多等待 60 秒；QueryEnd 确认最终结果"
   list_cfg devin "$HOME/.config/devin/config.json" nested "Devin for Terminal（devin CLI）；事件采集只记录，审批 hook 只在你于 Pitwall 中点击时作答。PermissionRequest 也会在无人值守时触发，不代表一定在等你"
   echo
   if [ -f "$ext" ]; then

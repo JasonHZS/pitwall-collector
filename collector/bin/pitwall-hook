@@ -19,7 +19,7 @@ fi
 
 # 后续异步事件不能撤回在本 hook 启动后才产生的审批请求。
 received_at=''
-case "$agent" in claude-code | codex | devin) received_at=$("$JQ" -n now) ;; esac
+case "$agent" in claude-code | codex | devin | qoder-cn) received_at=$("$JQ" -n now) ;; esac
 payload=$(/bin/cat)
 
 # 会话开始 / 任务开始时额外记录进程与终端线索，供之后「返回原会话」使用。
@@ -38,6 +38,8 @@ esac
 # 仅用 payload_keys 记录字段名，方便以后核对各 agent 的 payload 结构。
 # Claude Code 的 prompt_id（任务归属）、agent_id / agent_type（subagent 事件）与
 # is_interrupt（工具被用户中断）只是标识与布尔值，原样记录。
+# Qoder CN 的轮次 ID 来自 request_set_id / parent_request_set_id；原生等待通知只取
+# details.toolName / toolUseId 与输入摘要，不保留 details、选项或回答。QueryEnd 记录最终 reason。
 # Claude Code 的 Stop 另派生 background_subagent_running 布尔值与 background_task_shapes
 # （type/status 去重、最多 8 个、非法取值记为 ?），不保存任务描述、命令等详情。
 # 例外（用来告诉用户「在等什么」「结果如何」）：Claude Code 的 PermissionRequest 记 tool_summary
@@ -83,6 +85,10 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
 | ($p.background_tasks | if type == "array" then . else null end) as $bg
 | ($p.prompt | prompt_parts) as $prompt
 | def ask_payload: $agent == "codex" and $ev == "PreToolUse" and $p.tool_name == "request_user_input_async";
+  # 回答以 PreToolUse deny 原因交回 Qoder，后置失败 / 拒绝事件可能再次携带答案。
+  # 这些事件只需调用标识即可解除等待，不把它们的自由文本写入持久 spool。
+  def qoder_question_result: $agent == "qoder-cn" and $p.tool_name == "AskUserQuestion"
+    and ($ev == "PostToolUseFailure" or $ev == "PermissionDenied");
   def questions: $p.tool_input | if type == "object" then (.questions | if type == "array" then . else null end) else null end;
   # 回答是 JSON 数组，每项的 questionItemId 为 ["request_user_input_async", 调用 ID, 题目序号] 的 JSON 文本。
   def question_replies:
@@ -105,7 +111,7 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
     event: ($ev // "unknown"),
     session_id: (($p.session_id | blank) // ($p.conversation_id | blank)),
     turn_id: ($p.turn_id // $p.generation_id),
-    prompt_id: ($p.prompt_id | if type == "string" then cut(80) else null end),
+    prompt_id: ((if $agent == "qoder-cn" then ($p.request_set_id // $p.parent_request_set_id) else $p.prompt_id end) | if type == "string" then cut(80) else null end),
     agent_id: ($p.agent_id | if type == "string" then cut(80) else null end),
     agent_type: ($p.agent_type | if type == "string" then cut(60) else null end),
     is_interrupt: ($p.is_interrupt | if type == "boolean" then . else null end),
@@ -117,13 +123,13 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
     permission_mode: $p.permission_mode,
     model: ($p.model | if type == "string" then . else null end),
     source: $p.source,
-    tool_name: $p.tool_name,
+    tool_name: ($p.tool_name // (if $agent == "qoder-cn" then $p.details.toolName else null end)),
     notification_type: $p.notification_type,
     title: ($p.title | text | cut(120)),
-    message: ($p.message | text | cut(160)),
-    reason: ($p.reason | text | cut(120)),
+    message: (if qoder_question_result then null else ($p.message | text | cut(160)) end),
+    reason: (if qoder_question_result then null else ($p.reason | text | cut(120)) end),
     status: ($p.status | text | cut(40)),
-    error: ($p.error | text | cut(200)),
+    error: (if qoder_question_result then null else ($p.error | text | cut(200)) end),
     stop_hook_active: $p.stop_hook_active,
     background_subagent_running:
       (if $agent == "claude-code" and $ev == "Stop" and $bg != null
@@ -140,20 +146,24 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
     prompt_head: ($prompt.text | chrome_request | first_line),
     prompt_wrappers: ($prompt.tags | if length > 0 then . else null end),
     tool_summary:
-      (if $agent == "claude-code" and $ev == "PermissionRequest"
+      (if ($agent == "claude-code" or $agent == "qoder-cn") and $ev == "PermissionRequest"
        then ($p.tool_input
              | if type == "object" then (.command // .file_path // .notebook_path // .url // .path // .pattern) else null end
+             | line_head(120) | blank)
+       elif $agent == "qoder-cn" and $ev == "Notification" and $p.notification_type == "permission_prompt"
+       then ($p.details.input
+             | if type == "object" then (.command // .file_path // .url // .path // .questions[0].question) else null end
              | line_head(120) | blank)
        elif ask_payload
        then (questions | if . == null then null else .[0] end
              | if type == "object" then ([.title, .question] | map(line_head(120) | blank) | map(select(. != null)) | .[0]) else null end)
        else null
        end),
-    tool_use_id: (if ask_payload then ($p.tool_use_id | call_id) else null end),
+    tool_use_id: (if ask_payload or $agent == "qoder-cn" then (($p.tool_use_id // $p.details.toolUseId) | call_id) else null end),
     question_count: (if ask_payload then (questions | if . == null or length == 0 then null else ([length, 16] | min) end) else null end),
     question_replies: question_replies,
     reply_head:
-      (if $agent == "claude-code" and $ev == "Stop" then ($p.last_assistant_message | squashed(160) | blank) else null end),
+      (if ($agent == "claude-code" or $agent == "qoder-cn") and $ev == "Stop" then ($p.last_assistant_message | squashed(160) | blank) else null end),
     payload_keys: ($p | keys),
     ctx: ({
       ppid: ($ppid | tonumber? // null),
@@ -192,7 +202,12 @@ printf '%s\n' "$line" >> "$dir/$agent.jsonl" 2>/dev/null
 # 审批请求在终端里先被回答时，用随后的事件撤回 Pitwall 里那条请求，让等待中的
 # pitwall-approval 退出：工具事件只撤回唯一匹配的调用，轮次 / 会话结束撤回整个会话的。
 requests="${PITWALL_HOME:-$HOME/.pitwall}/approvals/requests"
-if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ]; } && [ -d "$requests" ]; then
+if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ] || [ "$agent" = qoder-cn ]; } && [ -d "$requests" ]; then
+  # 子 Agent 不能撤回主 Agent 的请求。Qoder 的工具 payload 没有可靠轮次 ID，
+  # 只按调用 ID / 唯一输入指纹撤回；同步 QueryEnd 才清理这一轮，Stop 不能代表结束。
+  if [ "$agent" = qoder-cn ]; then
+    printf '%s' "$payload" | "$JQ" -e '.agent_id == null' >/dev/null 2>&1 || exit 0
+  fi
   set -- "$requests"/*
   if [ -e "$1" ]; then
     session=$(printf '%s' "$line" | "$JQ" -r '
@@ -221,7 +236,7 @@ if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ];
             matches=$("$JQ" -r --arg agent "$agent" --arg session "$session" --arg turn "$turn" --arg tool "$tool" --arg call "$call_id" \
               --arg hash "$input_hash" --argjson unique "$unique" --argjson received "$received_at" '
               select(.agent == $agent and .session_id == $session and .tool_name == $tool and .created_at <= $received)
-              | select($agent == "claude-code" or ($turn != "" and .turn_id == $turn))
+              | select($agent == "claude-code" or $agent == "qoder-cn" or ($turn != "" and .turn_id == $turn))
               | select(if (.tool_use_id // "") != "" then .tool_use_id == $call and $call != ""
                        else $unique and .tool_input_sha256 == $hash end)
               | input_filename' "$requests/$scope."*.json 2>/dev/null)
@@ -231,13 +246,16 @@ if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ];
             fi
           fi
           ;;
-        Stop | StopFailure | UserPromptSubmit | SessionEnd | Interrupt)
+        Stop | StopFailure | UserPromptSubmit | SessionEnd | Interrupt | QueryEnd)
+          if [ "$agent" = qoder-cn ]; then
+            case "$kind" in QueryEnd | UserPromptSubmit | SessionEnd) ;; *) exit 0 ;; esac
+          elif [ "$kind" = QueryEnd ]; then exit 0; fi
           # Codex 的异步 UserPromptSubmit 没有可靠的轮次先后信息，不撤回任何请求。
           # 同轮 Stop / Interrupt、会话结束或审批超时负责回收，旧轮事件不会影响新轮。Devin 同样按轮次回收。
           "$JQ" -r --arg agent "$agent" --arg session "$session" --arg turn "$turn" \
             --arg kind "$kind" --argjson received "$received_at" '
             select(.agent == $agent and .session_id == $session)
-            | select($agent == "claude-code" or (.created_at <= $received and
+            | select($agent == "claude-code" or ($agent == "qoder-cn" and .created_at <= $received) or (.created_at <= $received and
                 ($kind == "SessionEnd" or ($kind != "UserPromptSubmit" and
                   $turn != "" and .turn_id == $turn))))
             | input_filename' "$requests/$scope."*.json 2>/dev/null |

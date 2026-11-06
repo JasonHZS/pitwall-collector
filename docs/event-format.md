@@ -26,7 +26,7 @@ This file format is the only public interface between the collector and anything
 | --- | --- | --- |
 | `v` | number | Format version, `1` |
 | `ts` | number | Observation time, milliseconds since the Unix epoch |
-| `agent` | string | `claude-code`, `codex`, `cursor`, `pi` or `devin`; new agents add new values |
+| `agent` | string | `claude-code`, `codex`, `cursor`, `pi`, `devin`, `opencode` or `qoder-cn`; new agents add new values |
 | `event` | string | The agent's own event name, unchanged (see [Events by agent](#events-by-agent)) |
 
 ### Identity and location
@@ -35,7 +35,7 @@ This file format is the only public interface between the collector and anything
 | --- | --- | --- |
 | `session_id` | string | The agent's session (or conversation) ID |
 | `turn_id` | string | The agent's ID for the current turn or generation, when it has one |
-| `prompt_id` | string | Claude Code: ID of the current request; follow-up input in the same turn keeps it. Truncated to 80 |
+| `prompt_id` | string | Claude Code: ID of the current request; follow-up input in the same turn keeps it. Qoder CN: `request_set_id` (Stop: `parent_request_set_id`). Truncated to 80 |
 | `agent_id`, `agent_type` | string | Claude Code: set on events from a subagent. Truncated to 80 and 60 |
 | `cwd` | string | Working directory of the session (Devin: its project directory) |
 | `workspace_roots` | array of strings | Cursor: the workspace folders |
@@ -60,7 +60,7 @@ This file format is the only public interface between the collector and anything
 | `stop_hook_active` | boolean | Claude Code `Stop`: the turn continues because of a stop hook |
 | `background_subagent_running` | boolean | Claude Code `Stop`: a background subagent was still running |
 | `background_task_shapes` | array of strings | Claude Code `Stop`: distinct `type/status` pairs of background tasks, at most 8; values outside `[A-Za-z0-9_.-]{1,40}` become `?` |
-| `tool_use_id` | string | Codex `PreToolUse` of `request_user_input_async`: the call id, if it matches `[A-Za-z0-9_.:-]{1,80}` |
+| `tool_use_id` | string | Codex `PreToolUse` of `request_user_input_async`, or Qoder CN tool / native permission notification: the call id, if it matches `[A-Za-z0-9_.:-]{1,80}` |
 | `question_count` | number | Codex `PreToolUse` of `request_user_input_async`: how many questions the call asks, at most 16 |
 | `question_replies` | array of objects | Codex `UserPromptSubmit` that answers async questions: `{call_id, index}` of each question answered, at most 16; the questions and answers are not recorded |
 
@@ -73,7 +73,7 @@ These exist so a board can show what a session is about, what it is waiting on a
 | `prompt_head` | string | First non-empty line of the request, truncated to 80. Blocks a client wraps around the request at its start (`<tag …>…</tag>`) are skipped first |
 | `prompt_wrappers` | array of strings | Names of the skipped wrapper tags, at most 8; the contents are not recorded |
 | `tool_summary` | string | Claude Code `PermissionRequest`: first non-empty line of the command, file path or URL being approved, truncated to 120. Codex `PreToolUse` of `request_user_input_async`: first non-empty line of the first question's title (or its `question` when the title is blank), truncated to 120 |
-| `reply_head` | string | Claude Code `Stop` and Pi `message_end`: the final reply squashed to one line, truncated to 160 |
+| `reply_head` | string | Claude Code / Qoder CN `Stop` and Pi `message_end`: the final reply squashed to one line, truncated to 160 |
 
 Nothing else from the request, tool inputs, tool outputs, replies or thinking is recorded. The excerpts above, paths and error text can still contain sensitive information: truncating isn't redacting. Files are never rotated or expired; uninstalling the collector or clearing Pitwall's history leaves them in place.
 
@@ -118,3 +118,11 @@ An event name alone is not always a reliable signal. For example, a permission r
 ```json
 {"v":1,"ts":1760140800123,"agent":"claude-code","event":"UserPromptSubmit","session_id":"3f6c2a1e-…","prompt_id":"b81d…","cwd":"/path/to/project","transcript_path":"/path/to/transcript.jsonl","prompt_head":"Fix the failing date parser test","payload_keys":["cwd","hook_event_name","prompt","prompt_id","session_id","transcript_path"],"ctx":{"ppid":48211,"proc":{"pid":"48211","ppid":"48190","tty":"ttys004","comm":"claude"},"term_program":"iTerm.app"}}
 ```
+
+### Qoder CN
+
+The installer registers `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, `PermissionDenied`, `Notification`, `Stop`, `StopFailure` and `QueryEnd`. Observation handlers always return success and no decision. The installer separately registers synchronous `pitwall-approval qoder-cn` handlers on `PermissionRequest` and exact-match `PreToolUse` for `AskUserQuestion`, each with timeout 65 seconds (internal wait limit 60 seconds).
+
+`QueryEnd` (standalone desktop 0.5.3 SDK extension) confirms the top-level final outcome: observed `reason` values are `end_turn` and `abort`. `Stop` alone may still be blocked by other hooks and is not a final outcome. Unknown reasons must not be guessed.
+
+The request's `request_set_id`, or Stop's `parent_request_set_id`, becomes `prompt_id`. Native `Notification(permission_prompt)` fields `details.toolName` / `details.toolUseId` become `tool_name` / `tool_use_id`; the details object is discarded. `tool_summary` retains only the first non-empty line of a command, path, URL or first question, truncated to 120 characters; question options and answers are not copied from those input fields. `Stop.last_assistant_message` becomes `reply_head`, whitespace collapsed and truncated to 160 characters. Project conversation files are not copied. Pending approval inputs, complete question forms and answers are temporary files under `~/.pitwall/approvals/`, not copied directly into event fields. However, the model may repeat submitted answers in its reply, which can then appear in `reply_head` and app task history; deleting approval files does not remove those excerpts. Question replies use `PreToolUse` deny with the answers in its reason; approval replies use `PermissionRequest` allow / deny. `AskUserQuestion` failure / denial events omit `error`, `reason` and `message`, which could repeat the submitted answers. Without a listener or on unsupported input, withdrawal or timeout, the decision hook emits nothing and Qoder continues its native flow.
