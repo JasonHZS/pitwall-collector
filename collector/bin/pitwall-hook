@@ -18,8 +18,13 @@ if [ ! -x "$JQ" ] || ! /bin/mkdir -p "$dir" 2>/dev/null; then
 fi
 
 # 后续异步事件不能撤回在本 hook 启动后才产生的审批请求。
+# 只有可能撤回请求的事件才需要它；每次工具调用的 PreToolUse 等不多启动一次 jq。
+withdraws=false
+case "$event" in
+  '' | PostToolUse | PostToolUseFailure | PermissionDenied | Stop | StopFailure | UserPromptSubmit | SessionEnd | Interrupt | QueryEnd) withdraws=true ;;
+esac
 received_at=''
-case "$agent" in claude-code | codex | devin | qoder-cn) received_at=$("$JQ" -n now) ;; esac
+case "$agent" in claude-code | codex | devin | qoder-cn | zcode) [ "$withdraws" = false ] || received_at=$("$JQ" -n now) ;; esac
 payload=$(/bin/cat)
 
 # 会话开始 / 任务开始时额外记录进程与终端线索，供之后「返回原会话」使用。
@@ -53,6 +58,11 @@ def text: if type == "string" or type == "null" then . else tojson end;
 def shape_token: if type == "string" and test("^[A-Za-z0-9_.-]{1,40}$") then . else "?" end;
 def line_head($n): if type == "string" then ([splits("\r?\n")] | map(select(test("\\S"))) | (.[0] // "") | sub("^\\s+"; "") | sub("\\s+$"; "") | cut($n)) else null end;
 def first_line: line_head(80);
+# Only AskUserQuestion owns this schema; other tools may use questions for arbitrary data.
+def question_head($tool):
+  if $tool == "AskUserQuestion" and (.questions | type) == "array" then
+    .questions[0] | if type == "object" then .question else null end
+  else null end;
 # 开头的注入块（<tag …>…</tag> 或 <tag …/>）逐个剥掉，只留标签名（最多 8 个，非法名记为 ?）。
 def unwrap($tags):
   (capture("\\A\\s*<(?<tag>[A-Za-z][A-Za-z0-9_.:-]*)(?:\\s[^<>]*)?(?:/>|>[\\s\\S]*?</\\k<tag>\\s*>)(?<rest>[\\s\\S]*)\\z") // null) as $m
@@ -106,11 +116,14 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
     else null end;
   {
     v: 1,
-    ts: (now * 1000 | floor),
+    ts: (if $agent == "zcode" then
+           (try (($p.timestamp | capture("^(?<whole>[^.]+)(?:\\.(?<ms>[0-9]{1,9}))?Z$")) as $t
+             | (($t.whole + "Z" | fromdateiso8601) * 1000 + (((($t.ms // "") + "000")[0:3]) | tonumber))) catch (now * 1000 | floor))
+         else (now * 1000 | floor) end),
     agent: $agent,
     event: ($ev // "unknown"),
     session_id: (($p.session_id | blank) // ($p.conversation_id | blank)),
-    turn_id: ($p.turn_id // $p.generation_id),
+    turn_id: ($p.turn_id // $p.generation_id // (if $agent == "zcode" then $p.turnId else null end)),
     prompt_id: ((if $agent == "qoder-cn" then ($p.request_set_id // $p.parent_request_set_id) else $p.prompt_id end) | if type == "string" then cut(80) else null end),
     agent_id: ($p.agent_id | if type == "string" then cut(80) else null end),
     agent_type: ($p.agent_type | if type == "string" then cut(60) else null end),
@@ -126,10 +139,10 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
     tool_name: ($p.tool_name // (if $agent == "qoder-cn" then $p.details.toolName else null end)),
     notification_type: $p.notification_type,
     title: ($p.title | text | cut(120)),
-    message: (if qoder_question_result then null else ($p.message | text | cut(160)) end),
-    reason: (if qoder_question_result then null else ($p.reason | text | cut(120)) end),
+    message: (if qoder_question_result or $agent == "zcode" then null else ($p.message | text | cut(160)) end),
+    reason: (if qoder_question_result or $agent == "zcode" then null else ($p.reason | text | cut(120)) end),
     status: ($p.status | text | cut(40)),
-    error: (if qoder_question_result then null else ($p.error | text | cut(200)) end),
+    error: (if qoder_question_result or $agent == "zcode" then null else ($p.error | text | cut(200)) end),
     stop_hook_active: $p.stop_hook_active,
     background_subagent_running:
       (if $agent == "claude-code" and $ev == "Stop" and $bg != null
@@ -146,20 +159,20 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
     prompt_head: ($prompt.text | chrome_request | first_line),
     prompt_wrappers: ($prompt.tags | if length > 0 then . else null end),
     tool_summary:
-      (if ($agent == "claude-code" or $agent == "qoder-cn") and $ev == "PermissionRequest"
+      (if ($agent == "claude-code" or $agent == "qoder-cn" or $agent == "zcode") and $ev == "PermissionRequest"
        then ($p.tool_input
-             | if type == "object" then (.command // .file_path // .notebook_path // .url // .path // .pattern) else null end
+             | if type == "object" then (.command // .file_path // .notebook_path // .url // .path // .pattern // question_head($p.tool_name)) else null end
              | line_head(120) | blank)
        elif $agent == "qoder-cn" and $ev == "Notification" and $p.notification_type == "permission_prompt"
        then ($p.details.input
-             | if type == "object" then (.command // .file_path // .url // .path // .questions[0].question) else null end
+             | if type == "object" then (.command // .file_path // .url // .path // question_head($p.details.toolName)) else null end
              | line_head(120) | blank)
        elif ask_payload
        then (questions | if . == null then null else .[0] end
              | if type == "object" then ([.title, .question] | map(line_head(120) | blank) | map(select(. != null)) | .[0]) else null end)
        else null
        end),
-    tool_use_id: (if ask_payload or $agent == "qoder-cn" then (($p.tool_use_id // $p.details.toolUseId) | call_id) else null end),
+    tool_use_id: (if ask_payload or $agent == "qoder-cn" or $agent == "zcode" then (($p.tool_use_id // $p.details.toolUseId) | call_id) else null end),
     question_count: (if ask_payload then (questions | if . == null or length == 0 then null else ([length, 16] | min) end) else null end),
     question_replies: question_replies,
     reply_head:
@@ -202,7 +215,8 @@ printf '%s\n' "$line" >> "$dir/$agent.jsonl" 2>/dev/null
 # 审批请求在终端里先被回答时，用随后的事件撤回 Pitwall 里那条请求，让等待中的
 # pitwall-approval 退出：工具事件只撤回唯一匹配的调用，轮次 / 会话结束撤回整个会话的。
 requests="${PITWALL_HOME:-$HOME/.pitwall}/approvals/requests"
-if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ] || [ "$agent" = qoder-cn ]; } && [ -d "$requests" ]; then
+[ "$withdraws" = true ] || exit 0
+if { [ "$agent" = claude-code ] || [ "$agent" = codex ] || [ "$agent" = devin ] || [ "$agent" = qoder-cn ] || [ "$agent" = zcode ]; } && [ -d "$requests" ]; then
   # 子 Agent 不能撤回主 Agent 的请求。Qoder 的工具 payload 没有可靠轮次 ID，
   # 只按调用 ID / 唯一输入指纹撤回；同步 QueryEnd 才清理这一轮，Stop 不能代表结束。
   if [ "$agent" = qoder-cn ]; then

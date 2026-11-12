@@ -478,6 +478,8 @@ check "监听过期：无输出退出并删除请求" sh -c "test ! -e '$reqfile
 check "Codex 缺少当前轮 metadata 时直接退出" test -z "$(printf '%s' "$req" | "$APPROVAL" codex)"
 sh "$root/tests/qoder-cn.sh" || fails=$((fails + 1))
 sh "$root/tests/qoder-approval.sh" || fails=$((fails + 1))
+sh "$root/tests/zcode.sh" || fails=$((fails + 1))
+sh "$root/tests/tool-summary.sh" || fails=$((fails + 1))
 sh "$root/tests/codex-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/devin-approval.sh" || fails=$((fails + 1))
 sh "$root/tests/pi-approval.sh" || fails=$((fails + 1))

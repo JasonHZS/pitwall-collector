@@ -1,6 +1,6 @@
 # Pitwall
 
-在 Mac 菜单栏监督你已经在跑的 Coding Agent。Pitwall 在本机统一查看 Codex、Claude Code、Cursor、Pi、OpenCode、Devin、Kimi Code、DeepSeek Harness 和 Qoder CN 的会话：谁已完成、失败或需要处理，并在能定位时返回原会话。Cursor 没有可靠的等待信号。不需要账号，采集的数据只留在你的 Mac 上。
+在 Mac 菜单栏监督你已经在跑的 Coding Agent。Pitwall 在本机统一查看 Codex、Claude Code、Cursor、Pi、OpenCode、Devin、Kimi Code、DeepSeek Harness、Qoder CN 和 ZCode 的会话：谁已完成、失败或需要处理，并在能定位时返回原会话。Cursor 没有可靠的等待信号。不需要账号，采集的数据只留在你的 Mac 上。
 
 [官网](https://pitwall.oasislab.dev) · [下载](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [English](README.md)
 
@@ -57,8 +57,9 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Kimi Code | 桌面版。只读自己的日志，不必装 hook | 审批和提问可以显示为等待。不能在 Pitwall 中作答 | 只打开应用。不用会新建对话的链接 |
 | Qoder CN | 独立桌面版 0.5.3；用户级 hooks | 原生提问已实测；新增在 Pitwall 批准 / 拒绝命令与回答问题（60 秒），接管交互待验收 | 只打开应用，未验证精准定位 |
 | DeepSeek Harness | 桌面版。状态只读本地日志，不必为采集装插件。可选导航插件已在 0.2.1-rc.3 与 rc.5 核对 | 命令审批与提问显示为等待。只能在 Harness 中回答 | 同意后，可选插件按会话 ID 跳转。否则只打开应用并说明原因 |
+| ZCode | 桌面版 3.17.2 内置原生 Agent；状态直接读本机记录 | 安装可选交互 hooks 后，在 Pitwall 中批准 / 拒绝工具请求和回答受支持的问题 | 只打开 ZCode |
 
-在 Pitwall 里批准或拒绝覆盖 Claude Code、Codex、Devin、Pi、OpenCode 和 Qoder CN；Qoder CN 的接管交互待真实验收。Cursor、Kimi Code 和 DeepSeek Harness 的审批不能在 Pitwall 里作答。
+在 Pitwall 里批准或拒绝覆盖 Claude Code、Codex、Devin、Pi、OpenCode、Qoder CN 和 ZCode；Qoder CN 的接管交互待真实验收。Cursor、Kimi Code 和 DeepSeek Harness 的审批不能在 Pitwall 里作答。
 
 精准返回标签页支持终端、iTerm2 和 Otty，条件是原进程仍占着那个 tty。tmux 要能定位唯一的本机客户端。Ghostty 1.3.1 没有 tty 接口，只打开应用。没有可靠信号时，Pitwall 不会猜测 Agent 正在等你。本机 Homebrew 的 `codex` 命令无法运行，不支持。
 
@@ -120,3 +121,17 @@ Cursor 不支持：它没有只在需要你确认时触发的 hook，`before*` h
 独立桌面版 0.5.3 已验证开始、完成、中断、原生提问与前台子 Agent。`Stop` 只作回复预览，最终结果由 `QueryEnd` 确认；原生等待通知按工具调用 ID 关联，避免并发工具返回误清等待。另登记同步审批与提问 hook，可在 Pitwall 中于 60 秒内批准 / 拒绝或回答，否则不输出决定并交回 Qoder 原生流程。未监听、不支持的提问、无效决定也交回原生流程；子 Agent 不接管。权限卡片、接管交互和致命错误尚待真实验证。IDE、CLI 与国际版不继承结论。
 
 请求 / 等待 / 回复摘要分别最多 80 / 120 / 160 字；采集器不把完整工具 payload 或审批文件复制到事件，App 不扫描 Qoder CN 的项目聊天文件。待批输入（显示 JSON 超过 4000 字符截断）、完整题目与选项、回答暂存在 `~/.pitwall/approvals/`，处理 / 撤回 / 超时后删除；输入指纹标记保留到会话结束。回答会交给模型，模型可能在回复中复述答案，使其进入事件的回复摘录及 App 任务历史；删除审批文件不会清除这些摘录。已有只观察安装需更新 / 修复，以登记两个决策 hook。
+
+## ZCode
+
+ZCode 桌面版 3.17.2 的内置原生 Agent 可直接监控运行状态，无需安装 hooks。要在 Pitwall 中处理权限请求和提问，在设置的 ZCode 详情里安装交互 hooks，或运行：
+
+```sh
+pitwall-collector install zcode
+```
+
+从本仓库安装时，用 `sh collector/install.sh install zcode`。安装器备份 `~/.zcode/cli/config.json`，保留其它 hooks。安装后新开一个 ZCode 任务。CLI、自动化和子 Agent 不在支持范围内。
+
+安装后可在 Pitwall 中批准或拒绝工具请求，以及回答支持的单选、多选和自定义问题。ZCode 原生界面同时可用，先回答的一方生效。Pitwall 未监听、等待超过 60 秒、问题包含选项预览或格式未知时，由 ZCode 原生界面处理。答案通过原生 `PermissionRequest` 的 `updatedInput` 回传，不写入 Pitwall 的事件文件或任务历史。
+
+用 `pitwall-collector uninstall zcode` 移除交互 hooks（从本仓库运行 `sh collector/install.sh uninstall zcode`）。如果安装器曾开启 hooks 总开关，卸载时会恢复原值；期间新增了其它 hooks 时保持开启。

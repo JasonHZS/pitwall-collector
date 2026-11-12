@@ -1,0 +1,51 @@
+#!/bin/sh
+# ZCode desktop native-agent interaction bridge. Session lifecycle still comes from its log.
+# Only root interactive sessions under the desktop app may publish requests.
+set -eu
+payload=$(/bin/cat)
+JQ=/usr/bin/jq
+fields=$(printf '%s' "$payload" | "$JQ" -er '
+  [.session_id, .turnId, .hook_event_name]
+  | select(all(.[]; type == "string" and test("^[A-Za-z0-9_.-]{1,128}$"))) | join(" ")' 2>/dev/null) || exit 0
+session=${fields%% *}; rest=${fields#* }; turn=${rest%% *}; event=${rest#* }
+case "$event" in PermissionRequest|PostToolUse|PostToolUseFailure|PreToolUse) ;; *) exit 0 ;; esac
+# Do not mistake a separately started CLI (even the bundled CLI) for a desktop session.
+# These hooks run synchronously on every tool call: one ps per ancestor, parsed in the shell.
+pid=$PPID
+desktop=false
+for step in 1 2 3 4 5 6 7 8; do
+  row=$(/bin/ps -p "$pid" -o ppid=,comm= 2>/dev/null) || break
+  case "$row" in
+    *'/ZCode.app/Contents/MacOS/ZCode') desktop=true; break ;;
+    *' ZCode')
+      # Electron changes its process title to ZCode; verify Launch Services identity as well.
+      identity=$(/usr/bin/lsappinfo info -only bundleID "$pid" 2>/dev/null) || identity=''
+      case "$identity" in *'bundleID="dev.zcode.app"'*) desktop=true; break ;; esac
+      ;;
+  esac
+  row=${row#"${row%%[! ]*}"}
+  pid=${row%% *}
+  case "$pid" in ''|0|1|*[!0-9]*) break ;; esac
+done
+[ "$desktop" = true ] || exit 0
+# Only an approval request needs the database: it may open a decision card. Other events
+# carry identifiers only, and the app drops subagent / non-interactive sessions itself.
+if [ "$event" = PermissionRequest ]; then
+  db="$HOME/.zcode/cli/db/db.sqlite"
+  [ -f "$db" ] || exit 0
+  data_root=$(/usr/bin/readlink -f "$HOME/.zcode") || exit 0
+  resolved_db=$(/usr/bin/readlink -f "$db") || exit 0
+  case "$resolved_db" in "$data_root/"*) ;; *) exit 0 ;; esac
+  root=$(/usr/bin/sqlite3 -readonly "$db" "SELECT 1 FROM session WHERE id='$session' AND parent_id IS NULL AND task_type='interactive' AND time_deleted IS NULL;" 2>/dev/null) || exit 0
+  [ "$root" = 1 ] || exit 0
+fi
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+printf '%s' "$payload" | "$here/pitwall-hook" zcode "$event"
+if [ "$event" = PermissionRequest ]; then
+  # The native dialog races this hook; ZCode cancels the hook when answered natively.
+  child=''
+  trap '[ -z "$child" ] || kill "$child" 2>/dev/null; exit 0' HUP INT TERM
+  printf '%s' "$payload" | "$here/pitwall-approval" zcode &
+  child=$!
+  wait "$child" || :
+fi

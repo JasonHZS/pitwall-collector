@@ -1,8 +1,8 @@
 #!/bin/sh
 # 安装 / 卸载 pitwall 的事件采集。
 #
-#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]   # 不带参数 = 全部
-#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]
+#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]   # 不带参数 = 全部
+#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]
 #
 # install：把 hook 脚本和查看工具复制到 ~/.pitwall/bin/，然后在各 agent 的全局配置里
 # 登记 pitwall 的 hook：已登记且一致的条目原样保留（位置不动），缺失或过时的才替换，
@@ -27,6 +27,9 @@ CURSOR_CFG="$HOME/.cursor/hooks.json"
 PI_EXT="$HOME/.pi/agent/extensions/pitwall.ts"
 DEVIN_CFG="$HOME/.config/devin/config.json"
 QODER_CN_CFG="$HOME/.qoder-cn/settings.json"
+ZCODE_CFG="$HOME/.zcode/cli/config.json"
+# hooks.enabled before Pitwall turned it on; only present while Pitwall owns that switch.
+ZCODE_STATE="$PW_HOME/zcode-hooks-state.json"
 # OpenCode 插件目录：server.ts 在后台服务中采集事件，tui.ts 在每个终端客户端中报告所显示的会话。
 OPENCODE_PLUGIN="$HOME/.config/opencode/plugins/pitwall"
 # 0.6 及更早版本安装的单文件插件；与目录插件同 ID，必须移除，否则服务端报重复插件。
@@ -240,6 +243,55 @@ uninstall_qoder_cn() {
     say "qoder-cn: pitwall hooks removed" "qoder-cn：已移除 pitwall hook"
 }
 
+install_zcode() {
+  [ -d "$HOME/.zcode/cli" ] || { say "zcode: not found, skipped" "zcode：未检测到，跳过"; return 0; }
+  # Enabling our integration must not activate someone else's disabled hooks.
+  if [ -e "$ZCODE_CFG" ] && ! "$JQ" -e '
+    (.hooks == null) or ((.hooks | type) == "object" and
+      (.hooks.enabled == true or ([.hooks.events // {} | .. | objects | select(has("command")) | .command | select(contains("pitwall-hook") | not)] | length == 0)))
+    ' "$ZCODE_CFG" >/dev/null 2>&1; then
+    say "  ✗ zcode: disabled or malformed third-party hooks; review them in ZCode first" "  ✗ zcode：存在已关闭的其它 hooks 或格式损坏；请先在 ZCode 中审核，未修改配置"
+    return 1
+  fi
+  # Remember how hooks.enabled looked before Pitwall turned it on, so uninstall can put it back.
+  wrote_state=false
+  if [ ! -e "$ZCODE_STATE" ]; then
+    state=$({ if [ -e "$ZCODE_CFG" ]; then cat "$ZCODE_CFG"; else printf '{}'; fi; } | "$JQ" -c '
+      (.hooks | if type == "object" then . else {} end) as $h
+      | select($h.enabled != true) | {had_enabled: ($h | has("enabled")), enabled: $h.enabled, had_events: ($h | has("events"))}') || return 1
+    if [ -n "$state" ]; then
+      mkdir -p "$PW_HOME" && printf '%s\n' "$state" > "$ZCODE_STATE" || return 1
+      wrote_state=true
+    fi
+  fi
+  edit_json "$ZCODE_CFG" '
+    . as $original | {hooks:(.hooks.events // {})}
+    | prune_nested($events)
+    | reduce $events[] as $e (.; ensure_nested($e; {hooks:[{type:"process",command:$bridge,timeoutMs:65000}]}))
+    | .hooks as $events | $original | .hooks.enabled = true | .hooks.events = $events
+    ' --arg bridge "$BIN_DIR/pitwall-hook-zcode" --argjson events '["PreToolUse","PermissionRequest","PostToolUse","PostToolUseFailure"]' ||
+    { [ "$wrote_state" = false ] || rm -f "$ZCODE_STATE"; return 1; }
+  say "zcode: interaction hooks installed; start a new task; native dialogs remain available" "zcode：交互 hooks 已安装；请新开任务；原生审批框保持可用"
+}
+
+uninstall_zcode() {
+  [ -e "$ZCODE_CFG" ] || { rm -f "$ZCODE_STATE"; return 0; }
+  state=null
+  [ -e "$ZCODE_STATE" ] && { state=$("$JQ" -c 'select(type == "object")' "$ZCODE_STATE" 2>/dev/null) && [ -n "$state" ] || state=null; }
+  # hooks.enabled is restored only when Pitwall turned it on and no other hooks were added since.
+  edit_json "$ZCODE_CFG" '
+    (if (.hooks.events | type) == "object" then
+      .hooks.events |= (with_entries(.value |= (map(.hooks |= map(select(ours | not))) | map(select((.hooks | length)>0)))) | with_entries(select((.value|length)>0)))
+    else . end)
+    | if $state != null and (.hooks | type) == "object"
+         and ([.hooks.events // {} | .. | objects | select(has("command"))] | length) == 0 then
+        (if $state.had_events or ((.hooks.events // {}) | length) > 0 then . else del(.hooks.events) end)
+        | (if $state.had_enabled then .hooks.enabled = $state.enabled else del(.hooks.enabled) end)
+        | (if .hooks == {} then del(.hooks) else . end)
+      else . end' --argjson state "$state" && rm -f "$ZCODE_STATE" &&
+    say "zcode: interaction hooks removed" "zcode：交互 hooks 已移除"
+}
+
 uninstall_claude() {
   [ -e "$CLAUDE_CFG" ] || return 0
   edit_json "$CLAUDE_CFG" 'strip_nested | if .hooks == {} then del(.hooks) else . end' &&
@@ -290,8 +342,8 @@ usage() {
 Install or remove Pitwall's event collection.
 安装或卸载 Pitwall 的事件采集。
 
-  $name install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]   # no agents = all / 不带参数 = 全部
-  $name uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn]
+  $name install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]   # no agents = all / 不带参数 = 全部
+  $name uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]
 
 install copies the hook scripts and the event viewer to ~/.pitwall/bin/ and registers Pitwall's
 hooks in each agent's global config. Entries already up to date stay where they are, missing or
@@ -317,6 +369,7 @@ run_agent() { # <动作前缀> <agent>
     devin) "$1"_devin ;;
     opencode) "$1"_opencode ;;
     qoder-cn) "$1"_qoder_cn ;;
+    zcode) "$1"_zcode ;;
     *) say "unknown agent: $2" "未知 agent：$2" ;;
   esac || failed="$failed $2"
 }
@@ -331,7 +384,7 @@ report_failed() {
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
-agents=${*:-claude-code codex cursor pi devin opencode qoder-cn}
+agents=${*:-claude-code codex cursor pi devin opencode qoder-cn zcode}
 
 [ -x "$JQ" ] || { say "needs /usr/bin/jq (part of macOS 15 and later)" "需要 /usr/bin/jq（macOS 15 起系统自带）"; exit 1; }
 
@@ -341,6 +394,7 @@ case "$cmd" in
     install -m 755 "$here/bin/pitwall-hook" "$HOOK"
     install -m 755 "$here/bin/pitwall-events" "$BIN_DIR/pitwall-events"
     install -m 755 "$here/bin/pitwall-approval" "$APPROVAL"
+    install -m 755 "$here/bin/pitwall-hook-zcode" "$BIN_DIR/pitwall-hook-zcode"
     for a in $agents; do run_agent install "$a"; done
     prune_backups
     [ -d "$BACKUP_DIR" ] && say "original configs backed up to $BACKUP_DIR" "原配置已备份到 $BACKUP_DIR"
