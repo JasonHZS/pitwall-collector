@@ -51,7 +51,7 @@ pitwall-collector uninstall   # or, with the DMG: sh /Applications/Pitwall.app/C
 | Agent | Tested with | Notified when it waits for you | Jump back to the session |
 | --- | --- | --- | --- |
 | Claude Code | CLI and the Claude desktop app | Yes | Desktop session, or the terminal tab |
-| Codex | Desktop app, built-in CLI, Chrome extension | Approval notifications for user-reviewed requests; passive status remains Unknown | Desktop session, or the terminal tab |
+| Codex | Desktop app and built-in CLI | Approval notifications for user-reviewed requests; passive status remains Unknown | Desktop session, or the terminal tab |
 | Cursor | IDE and background agents | No reliable signal; approving from Pitwall isn't supported | Opens Cursor |
 | Pi | Terminal | Yes, when an extension asks for input; allow / reject prompts can be answered from Pitwall | Terminal tab |
 | Devin | Devin for Terminal | Approval notifications for interactive sessions; passive status remains Unknown. Not shown as waiting | Selects the terminal tab by tty. A desktop session only opens the app |

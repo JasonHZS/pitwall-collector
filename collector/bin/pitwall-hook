@@ -28,15 +28,19 @@ case "$agent" in claude-code | codex | devin | qoder-cn | zcode) [ "$withdraws" 
 payload=$(/bin/cat)
 
 # 会话开始 / 任务开始时额外记录进程与终端线索，供之后「返回原会话」使用。
-proc='' parent_proc='' ghostty_env=''
+record_context=false
 case "$event" in
-  SessionStart | sessionStart | UserPromptSubmit | beforeSubmitPrompt)
-    proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$PPID" 2>/dev/null)
-    gp=$(printf '%s\n' "$proc" | /usr/bin/awk 'NR == 1 { print $2 }')
-    [ -n "$gp" ] && parent_proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$gp" 2>/dev/null)
-    ghostty_env=$(/usr/bin/env | /usr/bin/sed -n 's/^\(GHOSTTY_[A-Za-z0-9_]*\)=.*/\1/p' | /usr/bin/tr '\n' ' ')
-    ;;
+  SessionStart | sessionStart | UserPromptSubmit | beforeSubmitPrompt) record_context=true ;;
 esac
+proc='' parent_proc='' ghostty_env=''
+if [ "$record_context" = true ] || [ "$agent" = codex ]; then
+  proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$PPID" 2>/dev/null)
+  gp=$(printf '%s\n' "$proc" | /usr/bin/awk 'NR == 1 { print $2 }')
+  [ -n "$gp" ] && parent_proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$gp" 2>/dev/null)
+fi
+if [ "$record_context" = true ]; then
+  ghostty_env=$(/usr/bin/env | /usr/bin/sed -n 's/^\(GHOSTTY_[A-Za-z0-9_]*\)=.*/\1/p' | /usr/bin/tr '\n' ' ')
+fi
 
 # 只保留状态相关字段：prompt 只留首行前 80 字（开头由客户端成对标签包住的注入块，如
 # <in-app-browser-context …>…</in-app-browser-context>，先跳过，只把标签名记进 prompt_wrappers）；tool_input、工具输出、回复正文、邮箱等一律丢弃，
@@ -71,14 +75,6 @@ def unwrap($tags):
   end;
 # 剥完只剩空白时退回原文首行，不丢掉摘要。
 def prompt_parts: if type == "string" then (unwrap([]) as $u | if ($u.text | test("\\S")) then $u else {text: ., tags: []} end) else {text: null, tags: []} end;
-# Chrome 插件把标签页上下文放在固定的 Markdown 区块中；只在父进程是 Chrome 插件宿主时识别
-# 开头的完整区块（标签页列表可以为空），不把其它形态或用户正文里同名的标题当作分隔符。
-# 空请求保持缺失，不退回标签页上下文。
-def chrome_request:
-  if $agent == "codex" and ($parent_proc | contains("ChatGPT for Chrome")) and type == "string" then
-    (capture("\\A\\s*# Chrome tabs:[ \\t]*\\r?\\n(?:[\\s\\S]*?\\r?\\n)?## My request:(?<request>(?:[ \\t\\r\\n][\\s\\S]*)?)\\z") // null) as $m
-    | if $m == null then . else ($m.request | if test("\\S") then . else null end) end
-  else . end;
 def squashed($n): if type == "string" then (gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "") | cut($n)) else null end;
 def blank: if . == "" then null else . end;
 def call_id: if type == "string" and test("^[A-Za-z0-9_.:-]{1,80}$") then . else null end;
@@ -87,6 +83,8 @@ if type != "object" then error("payload is not an object") else . end
 # Cursor 会顺带执行 ~/.claude/settings.json 里的 Claude hook（payload 带 cursor_version）；
 # 同一事件已由 Cursor 自己的 hook 记录，这里跳过，避免把 Cursor 会话记成 Claude Code。
 | if $agent != "cursor" and has("cursor_version") then {_skip: true}
+# 旧版 Codex Chrome 侧栏不再采集。
+elif $agent == "codex" and ($parent_proc | proc_row | .comm // "" | test("(^|/)ChatGPT for Chrome[^/]*$")) then {_skip: true}
 # Devin CLI 兼容 Claude Code 的 hook 格式，可能顺带执行 ~/.claude/settings.json 里的 Claude hook。
 # Devin 的 payload 没有 transcript_path，且环境里有 DEVIN_PROJECT_DIR；这类事件跳过，只由 Devin 自己的 hook 记录。
 elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_path") | not) then {_skip: true} else
@@ -156,7 +154,7 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
              | unique | .[0:8])
        else null
        end),
-    prompt_head: ($prompt.text | chrome_request | first_line),
+    prompt_head: ($prompt.text | first_line),
     prompt_wrappers: ($prompt.tags | if length > 0 then . else null end),
     tool_summary:
       (if ($agent == "claude-code" or $agent == "qoder-cn" or $agent == "zcode") and $ev == "PermissionRequest"
@@ -180,8 +178,8 @@ elif $agent == "claude-code" and $devin_project_dir != "" and (has("transcript_p
     payload_keys: ($p | keys),
     ctx: ({
       ppid: ($ppid | tonumber? // null),
-      proc: ($proc | blank | proc_row),
-      parent_proc: ($parent_proc | blank | proc_row),
+      proc: (if $record_context then ($proc | blank | proc_row) else null end),
+      parent_proc: (if $record_context then ($parent_proc | blank | proc_row) else null end),
       term_program: ($term_program | blank),
       term_session_id: ($term_session_id | blank),
       iterm_session_id: ($iterm_session_id | blank),
@@ -197,7 +195,7 @@ end
 
 line=$(printf '%s' "$payload" | "$JQ" -c \
   --arg agent "$agent" --arg event "$event" --arg ppid "$PPID" \
-  --arg proc "$proc" --arg parent_proc "$parent_proc" --arg ghostty_env "$ghostty_env" \
+  --arg proc "$proc" --arg parent_proc "$parent_proc" --arg ghostty_env "$ghostty_env" --argjson record_context "$record_context" \
   --arg term_program "${TERM_PROGRAM:-}" --arg term_session_id "${TERM_SESSION_ID:-}" \
   --arg iterm_session_id "${ITERM_SESSION_ID:-}" --arg tmux_pane "${TMUX_PANE:-}" \
   --arg tmux "${TMUX:-}" \

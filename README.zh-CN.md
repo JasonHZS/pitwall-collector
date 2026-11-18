@@ -49,7 +49,7 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Agent | 已验证形态 | 等待处理时提醒 | 返回原会话 |
 | --- | --- | --- | --- |
 | Claude Code | CLI 与 Claude 桌面版 | 支持 | 桌面会话，或终端标签页 |
-| Codex | 桌面版、内置 CLI、Chrome 插件 | 用户审批请求支持批准通知；被动状态仍为未知 | 桌面会话，或终端标签页 |
+| Codex | 桌面版、内置 CLI | 用户审批请求支持批准通知；被动状态仍为未知 | 桌面会话，或终端标签页 |
 | Cursor | IDE 与后台 Agent | 没有可靠信号；不支持在 Pitwall 中审批 | 打开 Cursor |
 | Pi | 终端版 | 支持：扩展请求输入时；允许 / 拒绝类提示可在 Pitwall 中回答 | 终端标签页 |
 | Devin | Devin for Terminal | 不显示为等待。审批期间是状态未知。交互会话有审批通知 | 按 tty 选中终端标签。桌面会话只打开应用 |

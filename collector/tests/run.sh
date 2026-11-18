@@ -146,22 +146,17 @@ feed claude-code Stop '{"session_id":"claude-bg-done","cwd":"/tmp/proj-a","hook_
 feed claude-code Stop '{"session_id":"claude-bg-shell","cwd":"/tmp/proj-a","hook_event_name":"Stop","background_tasks":[{"id":"task-3","type":"shell","status":"running"}]}'
 feed codex UserPromptSubmit '{"session_id":"codex-wrapped","cwd":"/tmp/proj-b","hook_event_name":"UserPromptSubmit","prompt":"<in-app-browser-context source=\"ambient-ui-state\">\nurl: SECRET-CONTEXT\n</in-app-browser-context>\n\n修一下按钮"}'
 feed codex UserPromptSubmit "$("$JQ" -nc '{session_id: "codex-many-wrappers", prompt: (([range(1;10) | "<ctx\(.)>SECRET-CONTEXT</ctx\(.)>"] | join("")) + "\n真正的用户请求")}')"
-# Chrome 插件宿主（hook 的祖父进程）用指向 sh 的同名软链模拟；hook 与宿主之间隔一层，与 Codex 一致。
+# 用同名软链模拟已退役的 Codex Chrome 宿主，保持 hook 与宿主之间的一层 shell。
 mkdir -p "$tmp/chrome-host"
-ln -s /bin/bash "$tmp/chrome-host/ChatGPT for Chrome"
-cfeed() { # <payload>：在 Chrome 插件宿主下发 codex UserPromptSubmit
-  out=$(printf '%s' "$1" | "$tmp/chrome-host/ChatGPT for Chrome" -c '/bin/sh -c "\"\$0\" codex UserPromptSubmit; :" "$0"; :' "$HOOK")
-  [ -z "$out" ] || fail "chrome UserPromptSubmit 向 stdout 输出了内容：$out"
+chrome_host="$tmp/chrome-host/ChatGPT for Chrome"
+ln -s /bin/bash "$chrome_host"
+retired_host_hook() {
+  printf '%s' "$3" | "$chrome_host" -c '/bin/sh -c "\"\$0\" codex \"\$1\"; :" "$0" "$1"; :' "$1" "$2"
 }
-cfeed '{"session_id":"codex-chrome","prompt":"\n# Chrome tabs:\n- The user has the Chrome extension side panel open.\n- Current URL: https://example.com/SECRET-TAB\n\n## My request:\n\n检查 SQL 的新增用户条件\n第二行 SECRET-PROMPT"}'
-cfeed '{"session_id":"codex-chrome-wrapped","prompt":"<context>SECRET-CONTEXT</context>\r\n# Chrome tabs:\r\n- SECRET-TAB\r\n\r\n## My request:\r\n修复按钮\r\n## My request:\r\nSECRET-PROMPT"}'
-cfeed '{"session_id":"codex-chrome-empty","prompt":"# Chrome tabs:\n- SECRET-TAB\n\n## My request:\n   \n"}'
-cfeed '{"session_id":"codex-chrome-no-tabs","prompt":"# Chrome tabs:\n## My request:\n没有标签页时的请求"}'
-cfeed '{"session_id":"codex-chrome-inline","prompt":"# Chrome tabs:\n- SECRET-TAB\n## My request: 同一行的请求"}'
-cfeed '{"session_id":"codex-chrome-bare","prompt":"# Chrome tabs:\n- SECRET-TAB\n## My request:"}'
-cfeed '{"session_id":"codex-chrome-lookalike","prompt":"# Chrome tabs:\n- example\n## My requests: 不是分隔符"}'
-cfeed '{"session_id":"codex-chrome-literal","prompt":"# Chrome tabs:\n这是用户自己写的标题"}'
-cfeed '{"session_id":"codex-chrome-not-leading","prompt":"请解释下面的格式\n# Chrome tabs:\n- example\n\n## My request:\n这里不是本轮请求"}'
+out=$(retired_host_hook "$HOOK" UserPromptSubmit '{"session_id":"retired-chrome","prompt":"# Chrome tabs:\n- SECRET-TAB\n\n## My request:\n检查 SQL"}')
+check "已退役宿主的 prompt 不输出" test -z "$out"
+out=$(retired_host_hook "$HOOK" PreToolUse '{"session_id":"retired-chrome","tool_name":"exec_command"}')
+check "已退役宿主的工具事件不输出" test -z "$out"
 feed codex UserPromptSubmit '{"session_id":"codex-cli-chrome-shaped","prompt":"# Chrome tabs:\n- example\n\n## My request:\n这是 CLI 用户粘贴的正文"}'
 feed claude-code UserPromptSubmit '{"session_id":"claude-chrome-literal","prompt":"# Chrome tabs:\n- example\n\n## My request:\n这是普通用户正文"}'
 feed codex UserPromptSubmit '{"session_id":"codex-sess-1","turn_id":"turn-1","cwd":"/tmp/proj-b","hook_event_name":"UserPromptSubmit","prompt":"add tests","permission_mode":"on-request"}'
@@ -195,14 +190,7 @@ check "除约定的摘要外，不含 tool_input / prompt 正文 / 回复 / 邮�
 check "prompt_head 取首个非空行且 ≤ 81 字" "$JQ" -se '[.[] | select(.event == "UserPromptSubmit")][0].prompt_head | startswith("修复登录") and (length <= 81)' "$CL"
 jqcheck "开头的注入块被跳过，只记标签名" "$CX" 'select(.session_id == "codex-wrapped") | .prompt_head == "修一下按钮" and .prompt_wrappers == ["in-app-browser-context"]'
 jqcheck "超过 8 个注入块仍全部跳过，标签名仅记前 8 个" "$CX" 'select(.session_id == "codex-many-wrappers") | .prompt_head == "真正的用户请求" and .prompt_wrappers == [range(1;9) | "ctx\(.)"]'
-jqcheck "Chrome 上下文后提取实际请求，不记录标签页 URL" "$CX" 'select(.session_id == "codex-chrome") | .prompt_head == "检查 SQL 的新增用户条件"'
-jqcheck "Chrome 支持前置包装与 CRLF，保留首个请求后的正文" "$CX" 'select(.session_id == "codex-chrome-wrapped") | .prompt_head == "修复按钮" and .prompt_wrappers == ["context"]'
-jqcheck "Chrome 请求为空时摘要缺失，不退回上下文" "$CX" 'select(.session_id == "codex-chrome-empty" or .session_id == "codex-chrome-bare") | .prompt_head == null'
-jqcheck "Chrome 标签页列表为空时仍提取请求" "$CX" 'select(.session_id == "codex-chrome-no-tabs") | .prompt_head == "没有标签页时的请求"'
-jqcheck "Chrome 请求与分隔符同行时仍提取" "$CX" 'select(.session_id == "codex-chrome-inline") | .prompt_head == "同一行的请求"'
-jqcheck "相似但不同的分隔符不视为请求" "$CX" 'select(.session_id == "codex-chrome-lookalike") | .prompt_head == "# Chrome tabs:"'
-jqcheck "没有完整 Chrome 区块时不剥掉用户标题" "$CX" 'select(.session_id == "codex-chrome-literal") | .prompt_head == "# Chrome tabs:"'
-jqcheck "正文中的 Chrome 标题不影响请求首行" "$CX" 'select(.session_id == "codex-chrome-not-leading") | .prompt_head == "请解释下面的格式"'
+check "已退役宿主的事件不写入 spool" "$JQ" -se 'all(.[]; .session_id != "retired-chrome")' "$CX"
 jqcheck "非 Chrome 宿主的 Codex 不按插件区块剥离" "$CX" 'select(.session_id == "codex-cli-chrome-shaped") | .prompt_head == "# Chrome tabs:"'
 jqcheck "其它 Agent 的同名标题不视为插件上下文" "$CL" 'select(.session_id == "claude-chrome-literal") | .prompt_head == "# Chrome tabs:"'
 jqcheck "记录 prompt_id / agent_id / agent_type / is_interrupt" "$CL" 'select(.event == "PostToolUseFailure") | .prompt_id == "prompt-1" and .agent_id == "agent-7" and .agent_type == "general-purpose" and .is_interrupt == true'
@@ -351,6 +339,17 @@ req='{"session_id":"appr-sess","cwd":"/tmp/proj-a","hook_event_name":"Permission
 out=$(printf '%s' "$req" | "$APPROVAL" claude-code)
 check "Pitwall 未在监听：无输出、不留请求" sh -c "test -z '$out' && test ! -d '$APPR/requests' -o -z \"\$(ls -A '$APPR/requests' 2>/dev/null)\""
 mkdir -p "$APPR" && touch "$APPR/listening"
+retired_host_hook "$APPROVAL" "" '{"session_id":"retired-chrome","hook_event_name":"PreToolUse","tool_name":"request_user_input"}' > "$tmp/retired-approval.out" &
+retired_pid=$!
+tries=0
+while kill -0 "$retired_pid" 2>/dev/null && [ "$tries" -lt 20 ]; do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+check "已退役宿主的提问立即交回原生" test "$tries" -lt 20
+wait "$retired_pid"
+check "已退役宿主的提问不输出决定" test ! -s "$tmp/retired-approval.out"
+touch "$APPR/listening"
 # 后台等待，等请求文件出现后写入决定。
 await_request() { i=0; while [ $i -lt 50 ]; do set -- "$APPR"/requests/appr-sess.Bash.*.json; [ -e "$1" ] && { printf '%s' "$1"; return 0; }; sleep 0.1; i=$((i + 1)); done; return 1; }
 printf '%s' "$req" | "$APPROVAL" claude-code > "$tmp/approve.out" &

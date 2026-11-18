@@ -46,6 +46,15 @@ listening() {
 }
 listening || exit 0
 
+# 旧版 Codex Chrome 侧栏的请求交回原生审批。
+if [ "$agent" = codex ]; then
+  gp=$(/bin/ps -o ppid= -p "$PPID" 2>/dev/null | /usr/bin/awk 'NR == 1 { print $1 }')
+  if [ -n "$gp" ]; then
+    host=$(/bin/ps -o comm= -p "$gp" 2>/dev/null)
+    case "${host##*/}" in "ChatGPT for Chrome"*) exit 0 ;; esac
+  fi
+fi
+
 # 文件名带上会话与工具；撤回时再核对调用 ID 或完整输入的指纹，不能只按工具名删除。
 # 事件名、会话、工具名一次取出：会话不安全时整行为空。
 fields=$(printf '%s' "$payload" | "$JQ" -r '
