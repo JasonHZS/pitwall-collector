@@ -1,8 +1,8 @@
 #!/bin/sh
 # 安装 / 卸载 pitwall 的事件采集。
 #
-#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]   # 不带参数 = 全部
-#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]
+#   collector/install.sh install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode] [antigravity]   # 不带参数 = 全部
+#   collector/install.sh uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode] [antigravity]
 #
 # install：把 hook 脚本和查看工具复制到 ~/.pitwall/bin/，然后在各 agent 的全局配置里
 # 登记 pitwall 的 hook：已登记且一致的条目原样保留（位置不动），缺失或过时的才替换，
@@ -27,6 +27,7 @@ CURSOR_CFG="$HOME/.cursor/hooks.json"
 PI_EXT="$HOME/.pi/agent/extensions/pitwall.ts"
 DEVIN_CFG="$HOME/.config/devin/config.json"
 QODER_CN_CFG="$HOME/.qoder-cn/settings.json"
+ANTIGRAVITY_CFG="$HOME/.gemini/config/hooks.json"
 ZCODE_CFG="$HOME/.zcode/cli/config.json"
 # hooks.enabled before Pitwall turned it on; only present while Pitwall owns that switch.
 ZCODE_STATE="$PW_HOME/zcode-hooks-state.json"
@@ -243,6 +244,34 @@ uninstall_qoder_cn() {
     say "qoder-cn: pitwall hooks removed" "qoder-cn：已移除 pitwall hook"
 }
 
+antigravity_requested() {
+  case " ${explicit_agents:-} " in *" antigravity "*) return 0 ;; *) return 1 ;; esac
+}
+
+install_antigravity() {
+  antigravity_requested || [ -d "$HOME/.gemini/antigravity" ] || return 0
+  mkdir -p "$(dirname "$ANTIGRAVITY_CFG")" || return 1
+  edit_json "$ANTIGRAVITY_CFG" '
+    def entry($matcher): {PreToolUse: [{matcher: $matcher,
+      hooks: [{type: "command", command: (($approval | @sh) + " antigravity"), timeout: 65}]}]};
+    # On discovery, migrate only the exact legacy entry shipped by Pitwall.
+    if $action == "auto-install-antigravity" and has("pitwall-interactions")
+       and .["pitwall-interactions"] != entry("^(run_command|ask_question)$") then .
+    else .["pitwall-interactions"] = entry("^ask_question$") end
+  ' --arg approval "$APPROVAL" --arg action "$cmd" || return 1
+  rm -f "$PW_HOME/antigravity-hooks-uninstalled"
+}
+
+uninstall_antigravity() {
+  had_entry=0
+  if [ -e "$ANTIGRAVITY_CFG" ]; then
+    "$JQ" -e 'type == "object" and has("pitwall-interactions")' "$ANTIGRAVITY_CFG" >/dev/null 2>&1 && had_entry=1
+    edit_json "$ANTIGRAVITY_CFG" 'del(.["pitwall-interactions"])' || return 1
+  fi
+  antigravity_requested || [ "$had_entry" = 1 ] || [ -d "$HOME/.gemini/antigravity" ] || return 0
+  mkdir -p "$PW_HOME" && touch "$PW_HOME/antigravity-hooks-uninstalled"
+}
+
 install_zcode() {
   [ -d "$HOME/.zcode/cli" ] || { say "zcode: not found, skipped" "zcode：未检测到，跳过"; return 0; }
   # Enabling our integration must not activate someone else's disabled hooks.
@@ -342,8 +371,8 @@ usage() {
 Install or remove Pitwall's event collection.
 安装或卸载 Pitwall 的事件采集。
 
-  $name install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]   # no agents = all / 不带参数 = 全部
-  $name uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode]
+  $name install   [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode] [antigravity]   # no agents = all / 不带参数 = 全部
+  $name uninstall [claude-code] [codex] [cursor] [pi] [devin] [opencode] [qoder-cn] [zcode] [antigravity]
 
 install copies the hook scripts and the event viewer to ~/.pitwall/bin/ and registers Pitwall's
 hooks in each agent's global config. Entries already up to date stay where they are, missing or
@@ -370,6 +399,7 @@ run_agent() { # <动作前缀> <agent>
     opencode) "$1"_opencode ;;
     qoder-cn) "$1"_qoder_cn ;;
     zcode) "$1"_zcode ;;
+    antigravity) "$1"_antigravity ;;
     *) say "unknown agent: $2" "未知 agent：$2" ;;
   esac || failed="$failed $2"
 }
@@ -384,11 +414,21 @@ report_failed() {
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
-agents=${*:-claude-code codex cursor pi devin opencode qoder-cn zcode}
+explicit_agents=$*
+agents=${*:-claude-code codex cursor pi devin opencode qoder-cn zcode antigravity}
 
 [ -x "$JQ" ] || { say "needs /usr/bin/jq (part of macOS 15 and later)" "需要 /usr/bin/jq（macOS 15 起系统自带）"; exit 1; }
 
 case "$cmd" in
+  auto-install-antigravity)
+    # The app has detected the desktop bundle, even if it has never been opened.
+    [ "$agents" = antigravity ] || exit 2
+    [ ! -e "$PW_HOME/antigravity-hooks-uninstalled" ] || exit 0
+    mkdir -p "$BIN_DIR"
+    install -C -S -m 755 "$here/bin/pitwall-approval" "$APPROVAL"
+    install_antigravity
+    prune_backups
+    ;;
   install)
     mkdir -p "$BIN_DIR" "$PW_HOME/events"
     install -m 755 "$here/bin/pitwall-hook" "$HOOK"

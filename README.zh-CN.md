@@ -1,6 +1,6 @@
 # Pitwall
 
-在 Mac 菜单栏监督你已经在跑的 Coding Agent。Pitwall 在本机统一查看 Codex、Claude Code、Cursor、Pi、OpenCode、Devin、Kimi Code、DeepSeek Harness、Qoder CN 和 ZCode 的会话：谁已完成、失败或需要处理，并在能定位时返回原会话。Cursor 没有可靠的等待信号。不需要账号，采集的数据只留在你的 Mac 上。
+在 Mac 菜单栏监督你已经在跑的 Coding Agent。Pitwall 在本机统一查看 Codex、Claude Code、Cursor、Pi、OpenCode、Devin、Kimi Code、DeepSeek Harness、Qoder CN、ZCode 和 Antigravity 的会话：谁已完成、失败或需要处理，并在能定位时返回原会话。Cursor 没有可靠的等待信号。不需要账号，采集的数据只留在你的 Mac 上。
 
 [官网](https://pitwall.oasislab.dev) · [下载](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [English](README.md)
 
@@ -58,6 +58,7 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Qoder CN | 独立桌面版 0.5.3；用户级 hooks | 原生提问已实测；新增在 Pitwall 批准 / 拒绝命令与回答问题（60 秒），接管交互待验收 | 只打开应用，未验证精准定位 |
 | DeepSeek Harness | 桌面版。状态只读本地日志，不必为采集装插件。可选导航插件已在 0.2.1-rc.3 与 rc.5 核对 | 命令审批与提问显示为等待。只能在 Harness 中回答 | 同意后，可选插件按会话 ID 跳转。否则只打开应用并说明原因 |
 | ZCode | 桌面版 3.17.2 内置原生 Agent；状态直接读本机记录 | 安装可选交互 hooks 后，在 Pitwall 中批准 / 拒绝工具请求和回答受支持的问题 | 只打开 ZCode |
+| Antigravity | 桌面版 2.35.2；读取本机会话，监控无需 hooks | 原生命令审批会提示，回 Antigravity 处理。结构化提问走独立 hook，真实桌面问答待验收 | 通过可选的 macOS 辅助功能权限定位会话 |
 
 在 Pitwall 里批准或拒绝覆盖 Claude Code、Codex、Devin、Pi、OpenCode、Qoder CN 和 ZCode；Qoder CN 的接管交互待真实验收。Cursor、Kimi Code 和 DeepSeek Harness 的审批不能在 Pitwall 里作答。
 
@@ -135,3 +136,11 @@ pitwall-collector install zcode
 安装后可在 Pitwall 中批准或拒绝工具请求，以及回答支持的单选、多选和自定义问题。ZCode 原生界面同时可用，先回答的一方生效。Pitwall 未监听、等待超过 60 秒、问题包含选项预览或格式未知时，由 ZCode 原生界面处理。答案通过原生 `PermissionRequest` 的 `updatedInput` 回传，不写入 Pitwall 的事件文件或任务历史。
 
 用 `pitwall-collector uninstall zcode` 移除交互 hooks（从本仓库运行 `sh collector/install.sh uninstall zcode`）。如果安装器曾开启 hooks 总开关，卸载时会恢复原值；期间新增了其它 hooks 时保持开启。
+
+## Antigravity
+
+Pitwall 读取 Antigravity 桌面版的本机会话记录，监控会话状态和原生命令待批。命令在 Antigravity 原窗口处理。精准返回会话需要开启可选的 macOS 辅助功能权限。
+
+Pitwall 检测到 Antigravity 桌面版后自动安装结构化提问 hook。从本仓库手动管理时，可运行 `sh collector/install.sh install antigravity` 或 `sh collector/install.sh uninstall antigravity`。Homebrew 用户可通过 App 附带的 `pitwall-collector` 命令执行同样的操作。安装器修改前会备份 `~/.gemini/config/hooks.json`，并保留其他 hooks。新开的任务会加载配置。
+
+hook 接收结构化的 `ask_question` 调用。待回答的问题和答案暂存在本机，答案交回 Antigravity。60 秒内未回答时交回原生策略。真实桌面问答闭环待验收。

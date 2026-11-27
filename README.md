@@ -1,6 +1,6 @@
 # Pitwall
 
-Supervise the coding agents you already run, from the Mac menu bar. Pitwall is a local board for Codex, Claude Code, Cursor, Pi, OpenCode, Devin, Kimi Code, DeepSeek Harness and Qoder CN: see which sessions finished, failed, or need you, and jump back when it can tell which session that is. Cursor has no reliable waiting signal. No account, and what it collects stays on your Mac.
+Supervise the coding agents you already run, from the Mac menu bar. Pitwall is a local board for Codex, Claude Code, Cursor, Pi, OpenCode, Devin, Kimi Code, DeepSeek Harness, Qoder CN, ZCode and Antigravity: see which sessions finished, failed, or need you, and jump back when it can tell which session that is. Cursor has no reliable waiting signal. No account, and what it collects stays on your Mac.
 
 [Website](https://pitwall.oasislab.dev) · [Download](https://github.com/JasonHZS/pitwall-collector/releases/latest) · [中文](README.zh-CN.md)
 
@@ -59,8 +59,10 @@ pitwall-collector uninstall   # or, with the DMG: sh /Applications/Pitwall.app/C
 | Kimi Code | Desktop app. Reads its own logs; no hook to install | Approvals and questions can show as waiting. Cannot be answered in Pitwall | Opens the app only. Does not use links that start a new chat |
 | Qoder CN | Standalone desktop app 0.5.3; hooks in `~/.qoder-cn/settings.json` | Native questions verified. Approve / deny commands and answer questions in Pitwall for up to 60 seconds; live integration validation pending | Opens the app only; exact session navigation not verified |
 | DeepSeek Harness | Desktop app. Status is read from local logs; no plugin required for status. Optional navigation plugin checked on 0.2.1-rc.3 and rc.5 | Command approvals and questions show as waiting. Answer only in Harness | After you agree, the optional plugin jumps by session ID. Otherwise it only opens the app and says why |
+| ZCode | Desktop 3.17.2 built-in agent. Status is read from local records | Optional hooks enable in-app permission decisions and supported questions | Opens ZCode |
+| Antigravity | Desktop 2.35.2. Watches local sessions without hooks | Flags native command approvals, which you handle in Antigravity. Structured questions use a separate hook and await live desktop validation | Uses optional macOS Accessibility access to select the session |
 
-In-app approve or deny covers Claude Code, Codex, Devin, Pi, OpenCode and Qoder CN. Qoder CN interception awaits live validation. Cursor, Kimi Code and DeepSeek Harness approvals are not answered in Pitwall.
+In-app approve or deny covers Claude Code, Codex, Devin, Pi, OpenCode, Qoder CN and ZCode. Qoder CN interception awaits live validation. Cursor, Kimi Code and DeepSeek Harness approvals are not answered in Pitwall.
 
 Jumping to the exact tab works in Terminal, iTerm2 and Otty while the original process still holds that tty. tmux only when one local client can be found. Ghostty 1.3.1 has no tty interface, so Pitwall only opens the app. Pitwall doesn't guess: when a signal isn't reliable, it doesn't claim the agent is waiting. The Homebrew `codex` command does not run on this Mac and is not supported.
 
@@ -127,6 +129,14 @@ Verified with standalone Qoder CN 0.5.3: start, final completion, user interrupt
 
 The collector stores request / waiting / reply excerpts capped at 80 / 120 / 160 characters, plus identifiers and status metadata. It does not copy complete tool payloads or approval files into events, and the app does not read Qoder CN project conversation files. Pending approval inputs (display JSON capped at 4,000 characters), complete question forms and answers temporarily live in `~/.pitwall/approvals/` and are removed after handling, withdrawal or timeout; fingerprint markers remain until session end. Answers are passed to the model, which may repeat them in its reply; those words can then be saved in event reply excerpts and app task history. Removing approval files does not remove those excerpts. Existing observation-only installations need a repair or reinstall to add the two decision hooks.
 
-### ZCode (development integration)
+## ZCode
 
 `pitwall-collector install zcode` enables native desktop interaction hooks in `~/.zcode/cli/config.json`. Start a new task after installing. Lifecycle monitoring reads ZCode’s own local records; the optional hooks record approval/question waits and matching tool events. Native dialogs remain available. Supported question forms return structured answers through native `PermissionRequest` updated input; forms with option previews or unknown schemas stay native. The bridge does not claim CLI or subagent support. If installing had to turn `hooks.enabled` on, `uninstall zcode` restores the previous value, unless other hooks have been added since.
+
+## Antigravity
+
+Pitwall monitors Antigravity desktop sessions and native command approval waits from local records. Handle command approvals in Antigravity. Returning to a specific session uses optional macOS Accessibility access.
+
+Pitwall installs the structured question hook when it detects Antigravity desktop. To manage the hook manually from this repository, run `sh collector/install.sh install antigravity` or `sh collector/install.sh uninstall antigravity`. The bundled installer also exposes these commands through `pitwall-collector` for Homebrew users. It backs up `~/.gemini/config/hooks.json` before changes and preserves other hooks. Start a new task to load the configuration.
+
+The hook handles structured `ask_question` calls. Pending questions and answers are stored temporarily on your Mac, and answers are returned to Antigravity. After 60 seconds without an answer, control returns to Antigravity's native policy. Live desktop question handling still awaits validation.
