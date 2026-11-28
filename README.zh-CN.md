@@ -58,7 +58,7 @@ pitwall-collector uninstall   # DMG 安装时：sh /Applications/Pitwall.app/Con
 | Qoder CN | 独立桌面版 0.5.3；用户级 hooks | 原生提问已实测；新增在 Pitwall 批准 / 拒绝命令与回答问题（60 秒），接管交互待验收 | 只打开应用，未验证精准定位 |
 | DeepSeek Harness | 桌面版。状态只读本地日志，不必为采集装插件。可选导航插件已在 0.2.1-rc.3 与 rc.5 核对 | 命令审批与提问显示为等待。只能在 Harness 中回答 | 同意后，可选插件按会话 ID 跳转。否则只打开应用并说明原因 |
 | ZCode | 桌面版 3.17.2 内置原生 Agent；状态直接读本机记录 | 安装可选交互 hooks 后，在 Pitwall 中批准 / 拒绝工具请求和回答受支持的问题 | 只打开 ZCode |
-| Antigravity | 桌面版 2.35.2；读取本机会话，监控无需 hooks | 原生命令审批会提示，回 Antigravity 处理。结构化提问走独立 hook，真实桌面问答待验收 | 通过可选的 macOS 辅助功能权限定位会话 |
+| Antigravity | 桌面版 2.35.2 与 CLI（`agy`）1.5.18；读取本机会话，hooks 补充 CLI 审批、问答与终端线索 | 提示原生命令与提问等待；CLI 交互命令可在 Pitwall 批准 / 拒绝（最多 60 秒），桌面版命令仍在 Antigravity 处理；桌面版与 CLI 结构化提问可在 Pitwall 回答 | 桌面版通过可选的 macOS 辅助功能权限定位侧栏会话；CLI 按 tty / tmux pane 返回终端标签页 |
 
 在 Pitwall 里批准或拒绝覆盖 Claude Code、Codex、Devin、Pi、OpenCode、Qoder CN 和 ZCode；Qoder CN 的接管交互待真实验收。Cursor、Kimi Code 和 DeepSeek Harness 的审批不能在 Pitwall 里作答。
 
@@ -139,8 +139,9 @@ pitwall-collector install zcode
 
 ## Antigravity
 
-Pitwall 读取 Antigravity 桌面版的本机会话记录，监控会话状态和原生命令待批。命令在 Antigravity 原窗口处理。精准返回会话需要开启可选的 macOS 辅助功能权限。
+Pitwall 读取 Antigravity 桌面版（`~/.gemini/antigravity/`）与 CLI（`agy`，`~/.gemini/antigravity-cli/`）的本机会话记录，监控会话状态和原生命令 / 提问等待。桌面版精准返回会话使用可选的 macOS 辅助功能权限；CLI 返回原终端标签页使用 tty 或 tmux pane 线索。
 
-Pitwall 检测到 Antigravity 桌面版后自动安装结构化提问 hook。从本仓库手动管理时，可运行 `sh collector/install.sh install antigravity` 或 `sh collector/install.sh uninstall antigravity`。Homebrew 用户可通过 App 附带的 `pitwall-collector` 命令执行同样的操作。安装器修改前会备份 `~/.gemini/config/hooks.json`，并保留其他 hooks。新开的任务会加载配置。
+Pitwall 检测到 Antigravity 桌面版或 `agy` 后自动安装交互 hooks。从本仓库手动管理时，可运行 `sh collector/install.sh install antigravity` 或 `sh collector/install.sh uninstall antigravity`。Homebrew 用户可通过 App 附带的 `pitwall-collector` 命令执行同样的操作。安装器修改前会备份 `~/.gemini/config/hooks.json`，并保留其他 hooks。新开的任务会加载配置。
 
-hook 接收结构化的 `ask_question` 调用。待回答的问题和答案暂存在本机，答案交回 Antigravity。60 秒内未回答时交回原生策略。真实桌面问答闭环待验收。
+- `pitwall-hook-antigravity` 挂在 `SessionStart`、`PreInvocation` 与 `Stop`，只为 CLI 会话把标识、目录、终止原因或错误及终端线索追加到 `~/.pitwall/events/antigravity.jsonl`，不摘录用户输入；桌面版与 IDE 载荷直接返回且不写盘。
+- `pitwall-approval antigravity` 挂在 `PreToolUse`（`^ask_question$` 与 `^run_command$`）：接管桌面版与 CLI 的结构化 `ask_question` 提问，以及 CLI 交互会话的 `run_command` 审批（跳过 `-p` 打印模式、`--dangerously-skip-permissions` 与默认 `auto` 模式下的沙盒命令）。桌面版 `run_command` 与 IDE 载荷立即返回 `allow` 交回原生策略。待批请求、问题和回答暂存在本机，处理或 60 秒超时后清理并回落原生界面。

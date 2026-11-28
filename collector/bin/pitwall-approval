@@ -50,19 +50,78 @@ listening() {
 }
 listening || exit 0
 
-# The global hooks file is shared with CLI and IDE. Only handle desktop calls.
+# The global hooks file is shared with CLI and IDE.
+# Desktop handles structured questions only; CLI handles both structured questions and interactive command approvals.
 if [ "$agent" = antigravity ]; then
-  payload=$(printf '%s' "$payload" | "$JQ" -ce --arg brain "$HOME/.gemini/antigravity/brain/" '
+  ag_cli_args='' ag_cli_settings='{}' ag_cli_mode=''
+  case "$payload" in
+    *antigravity-cli/brain/*)
+      ag_cli_args=$(/bin/ps -o args= -p "$PPID" 2>/dev/null || true)
+      ag_opts=" ${ag_cli_args%% -- *} "
+      case "$ag_opts" in
+        *" -p"* | *" --print "* | *" --print="* | *" --prompt "* | *" --prompt="*) exit 0 ;;
+      esac
+      case "$ag_opts" in
+        *" --dangerously-skip-permissions "*) ag_cli_mode="__skip__" ;;
+        *" --mode="*)
+          ag_cli_mode=${ag_opts#* --mode=}
+          ag_cli_mode=${ag_cli_mode%% *}
+          ;;
+        *" --mode "*)
+          ag_cli_mode=${ag_opts#* --mode }
+          ag_cli_mode=${ag_cli_mode%% *}
+          ;;
+      esac
+      ag_settings_file="$HOME/.gemini/antigravity-cli/settings.json"
+      if [ -f "$ag_settings_file" ] && [ -r "$ag_settings_file" ]; then
+        ag_parsed=$("$JQ" -c 'if type == "object" then . else {} end' "$ag_settings_file" 2>/dev/null) && [ -n "$ag_parsed" ] && ag_cli_settings=$ag_parsed
+      fi
+      ;;
+  esac
+  payload=$(printf '%s' "$payload" | "$JQ" -ce \
+    --arg desktop_brain "$HOME/.gemini/antigravity/brain/" \
+    --arg cli_brain "$HOME/.gemini/antigravity-cli/brain/" \
+    --arg cli_mode "$ag_cli_mode" \
+    --argjson cli_settings "$ag_cli_settings" '
     select(.conversationId | type == "string" and test("^[a-zA-Z0-9_-]{1,128}$"))
-    | select(.artifactDirectoryPath == ($brain + .conversationId)
-          or .artifactDirectoryPath == ("~/.gemini/antigravity/brain/" + .conversationId))
-    | select(.toolCall.name == "ask_question")
-    | .toolCall.args as $args
-    | select(($args.questions | type) == "array" and all($args.questions[]; (.options | type) == "array"))
-    | {session_id: .conversationId, hook_event_name: "PreToolUse", tool_name: "ask_question",
-       tool_input: {questions: ($args.questions | map({
-         question, multiSelect: (.is_multi_select // false), options: (.options | map({label: .}))
-       }))}, cwd: ($args.Cwd // .workspacePaths[0])}' 2>/dev/null) || exit 0
+    | (if .artifactDirectoryPath == ($desktop_brain + .conversationId)
+          or .artifactDirectoryPath == ("~/.gemini/antigravity/brain/" + .conversationId) then "desktop"
+       elif .artifactDirectoryPath == ($cli_brain + .conversationId)
+          or .artifactDirectoryPath == ("~/.gemini/antigravity-cli/brain/" + .conversationId) then "cli"
+       else empty end) as $variant
+    | .toolCall as $call | $call.args as $args
+    | select(($call | type) == "object" and ($args | type) == "object")
+    | if $call.name == "ask_question" then
+        select(($args.questions | type) == "array" and all($args.questions[]; (.options | type) == "array"))
+        | {session_id: .conversationId, variant: $variant, hook_event_name: "PreToolUse", tool_name: "ask_question",
+           tool_use_id: ($call.id | if type == "string" and length > 0 then . else null end),
+           tool_input: {questions: ($args.questions | map({
+             question, multiSelect: (.is_multi_select // false), options: (.options | map({label: .}))
+           }))}, cwd: ($args.Cwd // .cwd // .workspacePaths[0])}
+      elif $variant == "cli" and $call.name == "run_command" then
+        select($cli_mode != "__skip__")
+        | select(($args.CommandLine | type) == "string" and ($args.CommandLine | test("\\S")))
+        | ($cli_settings.toolPermission // "") as $perm
+        | (if $cli_mode != "" then $cli_mode
+           elif ($cli_settings | has("agentMode")) then ($cli_settings.agentMode // "")
+           else "auto" end) as $mode
+        | (($cli_settings.permissions.ask // []) | if type == "array" then any(. == "command(*)") else false end) as $ask_all
+        | ($args.BypassSandbox == true) as $unsandboxed
+        | select(
+            if $perm == "always-proceed" then $ask_all
+            elif $perm == "strict" then true
+            elif $unsandboxed then true
+            elif $perm == "proceed-in-sandbox" then $ask_all
+            elif $mode == "auto" then $ask_all
+            else true end)
+        | ({command: $args.CommandLine}
+           + (if ($args.Cwd | type) == "string" and ($args.Cwd | length) > 0 then {cwd: $args.Cwd} else {} end)
+           + (if $unsandboxed then {bypass_sandbox: true} else {} end)) as $cmd_input
+        | select(($cmd_input | tojson | length) <= 4000)
+        | {session_id: .conversationId, variant: "cli", hook_event_name: "PreToolUse", tool_name: "run_command",
+           tool_use_id: ($call.id | if type == "string" and length > 0 then . else null end),
+           tool_input: $cmd_input, cwd: ($args.Cwd // .cwd // .workspacePaths[0])}
+      else empty end' 2>/dev/null) || exit 0
 fi
 
 # 旧版 Codex Chrome 侧栏的请求交回原生审批。
@@ -91,6 +150,7 @@ tool=${rest#* }
 # 既不能回答也不能批准，立即交回原生界面，不让它白等 60 秒。
 question=false
 case "$agent:$event:$tool" in
+  antigravity:PreToolUse:run_command) ;;
   antigravity:PreToolUse:ask_question | claude-code:PermissionRequest:AskUserQuestion | zcode:PermissionRequest:AskUserQuestion | codex:PreToolUse:request_user_input | devin:PreToolUse:ask_user_question | qoder-cn:PreToolUse:AskUserQuestion) question=true ;;
   codex:PermissionRequest:request_user_input | devin:PermissionRequest:ask_user_question | qoder-cn:PermissionRequest:AskUserQuestion | *:PreToolUse:*) exit 0 ;;
 esac
@@ -179,6 +239,7 @@ printf '%s' "$payload" | "$JQ" -c --arg id "$id" --arg agent "$agent" --argjson 
   --arg project "${DEVIN_PROJECT_DIR:-}" --argjson question "$question" '
   def cap: if (tojson | length) > 4000 then {_truncated: (tojson | .[0:4000])} else . end;
   {v: 1, id: $id, agent: $agent, created_at: now, pid: $pid, session_id,
+   variant: (if $agent == "antigravity" and (.variant | type) == "string" then .variant else null end),
    turn_id: (if $agent == "devin" then .prompt_id elif $agent == "qoder-cn" then .request_set_id elif $agent == "zcode" then .turnId else .turn_id end),
    cwd: (.cwd // (if $agent == "devin" and $project != "" then $project else null end)),
    answer_format: (if $question then "answers-v1" else null end),
@@ -224,6 +285,13 @@ while :; do
     fi
     answer=$(/usr/bin/head -c 16 "$decision")
     cleanup
+    if [ "$agent" = antigravity ]; then
+      case "$answer" in
+        allow) trap - EXIT; printf '%s\n' '{"decision":"auto_approve"}' ;;
+        deny) trap - EXIT; printf '%s\n' '{"decision":"deny","reason":"Denied in Pitwall."}' ;;
+      esac
+      exit 0
+    fi
     case "$answer" in
       allow) printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}' ;;
       deny) printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied in Pitwall."}}}' ;;

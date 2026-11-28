@@ -248,17 +248,33 @@ antigravity_requested() {
   case " ${explicit_agents:-} " in *" antigravity "*) return 0 ;; *) return 1 ;; esac
 }
 
+antigravity_present() {
+  [ -d "$HOME/.gemini/antigravity" ] || [ -d "$HOME/.gemini/antigravity-cli" ] ||
+    [ -x "$HOME/.local/bin/agy" ] || command -v agy >/dev/null 2>&1
+}
+
 install_antigravity() {
-  antigravity_requested || [ -d "$HOME/.gemini/antigravity" ] || return 0
+  antigravity_requested || antigravity_present || return 0
   mkdir -p "$(dirname "$ANTIGRAVITY_CFG")" || return 1
   edit_json "$ANTIGRAVITY_CFG" '
-    def entry($matcher): {PreToolUse: [{matcher: $matcher,
+    def legacy_entry($matcher): {PreToolUse: [{matcher: $matcher,
       hooks: [{type: "command", command: (($approval | @sh) + " antigravity"), timeout: 65}]}]};
-    # On discovery, migrate only the exact legacy entry shipped by Pitwall.
+    def current_entry: {
+      SessionStart: [{type: "command", command: (($ag_hook | @sh) + " SessionStart"), timeout: 5}],
+      PreInvocation: [{type: "command", command: (($ag_hook | @sh) + " PreInvocation"), timeout: 5}],
+      Stop: [{type: "command", command: (($ag_hook | @sh) + " Stop"), timeout: 5}],
+      PreToolUse: [
+        {matcher: "^ask_question$", hooks: [{type: "command", command: (($approval | @sh) + " antigravity"), timeout: 65}]},
+        {matcher: "^run_command$", hooks: [{type: "command", command: (($approval | @sh) + " antigravity"), timeout: 65}]}
+      ]
+    };
+    # On discovery, migrate only the exact legacy entries shipped by Pitwall.
     if $action == "auto-install-antigravity" and has("pitwall-interactions")
-       and .["pitwall-interactions"] != entry("^(run_command|ask_question)$") then .
-    else .["pitwall-interactions"] = entry("^ask_question$") end
-  ' --arg approval "$APPROVAL" --arg action "$cmd" || return 1
+       and .["pitwall-interactions"] != legacy_entry("^(run_command|ask_question)$")
+       and .["pitwall-interactions"] != legacy_entry("^ask_question$")
+       and .["pitwall-interactions"] != current_entry then .
+    else .["pitwall-interactions"] = current_entry end
+  ' --arg approval "$APPROVAL" --arg ag_hook "$BIN_DIR/pitwall-hook-antigravity" --arg action "$cmd" || return 1
   rm -f "$PW_HOME/antigravity-hooks-uninstalled"
 }
 
@@ -268,7 +284,7 @@ uninstall_antigravity() {
     "$JQ" -e 'type == "object" and has("pitwall-interactions")' "$ANTIGRAVITY_CFG" >/dev/null 2>&1 && had_entry=1
     edit_json "$ANTIGRAVITY_CFG" 'del(.["pitwall-interactions"])' || return 1
   fi
-  antigravity_requested || [ "$had_entry" = 1 ] || [ -d "$HOME/.gemini/antigravity" ] || return 0
+  antigravity_requested || [ "$had_entry" = 1 ] || antigravity_present || return 0
   mkdir -p "$PW_HOME" && touch "$PW_HOME/antigravity-hooks-uninstalled"
 }
 
@@ -421,11 +437,12 @@ agents=${*:-claude-code codex cursor pi devin opencode qoder-cn zcode antigravit
 
 case "$cmd" in
   auto-install-antigravity)
-    # The app has detected the desktop bundle, even if it has never been opened.
+    # The app has detected Antigravity desktop or CLI, even if it has never been opened.
     [ "$agents" = antigravity ] || exit 2
     [ ! -e "$PW_HOME/antigravity-hooks-uninstalled" ] || exit 0
-    mkdir -p "$BIN_DIR"
+    mkdir -p "$BIN_DIR" "$PW_HOME/events"
     install -C -S -m 755 "$here/bin/pitwall-approval" "$APPROVAL"
+    install -C -S -m 755 "$here/bin/pitwall-hook-antigravity" "$BIN_DIR/pitwall-hook-antigravity"
     install_antigravity
     prune_backups
     ;;
@@ -435,6 +452,7 @@ case "$cmd" in
     install -m 755 "$here/bin/pitwall-events" "$BIN_DIR/pitwall-events"
     install -m 755 "$here/bin/pitwall-approval" "$APPROVAL"
     install -m 755 "$here/bin/pitwall-hook-zcode" "$BIN_DIR/pitwall-hook-zcode"
+    install -m 755 "$here/bin/pitwall-hook-antigravity" "$BIN_DIR/pitwall-hook-antigravity"
     for a in $agents; do run_agent install "$a"; done
     prune_backups
     [ -d "$BACKUP_DIR" ] && say "original configs backed up to $BACKUP_DIR" "原配置已备份到 $BACKUP_DIR"

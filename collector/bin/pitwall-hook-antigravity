@@ -1,0 +1,89 @@
+#!/bin/sh
+# pitwall-hook-antigravity: record sanitized Antigravity CLI lifecycle events and terminal clues.
+#
+#   pitwall-hook-antigravity <SessionStart|PreInvocation|Stop>
+#
+# Non-CLI payloads (Antigravity Desktop / IDE) exit immediately with valid JSON stdout so shared
+# ~/.gemini/config/hooks.json adds negligible overhead and never blocks other surfaces.
+# Antigravity runs hooks synchronously and requires valid JSON on stdout.
+
+event=${1:-}
+case "$event" in
+  Stop) trap 'printf "%s\n" "{\"decision\":\"stop\"}"' EXIT ;;
+  SessionStart | PreInvocation) trap 'printf "%s\n" "{}"' EXIT ;;
+  *) exit 0 ;;
+esac
+
+payload=$(/bin/cat)
+case "$payload" in
+  *antigravity-cli/brain/*) ;;
+  *) exit 0 ;;
+esac
+
+JQ=/usr/bin/jq
+dir="${PITWALL_HOME:-$HOME/.pitwall}/events"
+[ -x "$JQ" ] && /bin/mkdir -p "$dir" 2>/dev/null || exit 0
+
+proc='' parent_proc='' ghostty_env=''
+record_context=false
+case "$event" in
+  SessionStart | PreInvocation) record_context=true ;;
+esac
+if [ "$record_context" = true ]; then
+  proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$PPID" 2>/dev/null)
+  gp=$(printf '%s\n' "$proc" | /usr/bin/awk 'NR == 1 { print $2 }')
+  [ -n "$gp" ] && parent_proc=$(/bin/ps -o pid=,ppid=,tty=,comm= -p "$gp" 2>/dev/null)
+  ghostty_env=$(/usr/bin/env | /usr/bin/sed -n 's/^\(GHOSTTY_[A-Za-z0-9_]*\)=.*/\1/p' | /usr/bin/tr '\n' ' ')
+fi
+
+line=$(printf '%s' "$payload" | "$JQ" -c \
+  --arg event "$event" \
+  --arg cli_brain "$HOME/.gemini/antigravity-cli/brain/" \
+  --arg ppid "$PPID" \
+  --arg proc "$proc" \
+  --arg parent_proc "$parent_proc" \
+  --arg ghostty_env "$ghostty_env" \
+  --argjson record_context "$record_context" \
+  --arg term_program "${TERM_PROGRAM:-}" \
+  --arg term_session_id "${TERM_SESSION_ID:-}" \
+  --arg iterm_session_id "${ITERM_SESSION_ID:-}" \
+  --arg tmux_pane "${TMUX_PANE:-}" \
+  --arg tmux "${TMUX:-}" \
+  --arg bundle_id "${__CFBundleIdentifier:-}" '
+  def cut($n): if type == "string" and length > $n then .[0:$n] + "…" else . end;
+  def blank: if . == "" then null else . end;
+  def proc_row: if . == null then null else (capture("^\\s*(?<pid>[0-9]+)\\s+(?<ppid>[0-9]+)\\s+(?<tty>\\S+)\\s+(?<comm>.*)$") // null) end;
+  select(type == "object")
+  | select(.conversationId | type == "string" and test("^[A-Za-z0-9_.-]{1,128}$"))
+  | select(.artifactDirectoryPath == ($cli_brain + .conversationId)
+        or .artifactDirectoryPath == ("~/.gemini/antigravity-cli/brain/" + .conversationId))
+  | {
+      v: 1,
+      ts: (now * 1000 | floor),
+      agent: "antigravity",
+      event: $event,
+      session_id: .conversationId,
+      cwd: ((.cwd | if type == "string" then blank else null end)
+            // (.workspacePaths | if type == "array" and (.[0] | type) == "string" then (.[0] | blank) else null end)),
+      reason: (if $event == "Stop" and (.terminationReason | type) == "string" then (.terminationReason | cut(120) | blank) else null end),
+      error: (if $event == "Stop" and (.error | type) == "string" then (.error | cut(200) | blank) else null end),
+      status: (if $event == "Stop" and (.fullyIdle | type) == "boolean" then (if .fullyIdle then "idle" else "active" end) else null end),
+      ctx: ({
+        ppid: ($ppid | tonumber? // null),
+        proc: (if $record_context then ($proc | blank | proc_row) else null end),
+        parent_proc: (if $record_context then ($parent_proc | blank | proc_row) else null end),
+        term_program: ($term_program | blank),
+        term_session_id: ($term_session_id | blank),
+        iterm_session_id: ($iterm_session_id | blank),
+        tmux_pane: ($tmux_pane | blank),
+        tmux_socket: ($tmux | if test("^/[^\\r\\n]*,[0-9]+,[0-9]+$") then sub(",[0-9]+,[0-9]+$"; "") else null end),
+        bundle_id: ($bundle_id | blank),
+        ghostty_env: ($ghostty_env | blank)
+      } | with_entries(select(.value != null)))
+    }
+  | with_entries(select(.value != null and .value != {}))
+' 2>/dev/null)
+
+[ -n "$line" ] || exit 0
+printf '%s\n' "$line" >> "$dir/antigravity.jsonl" 2>/dev/null
+exit 0
